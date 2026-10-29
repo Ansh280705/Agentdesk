@@ -15,6 +15,7 @@ import KnowledgePage from '@/pages/Knowledge';
 import TasksPage from '@/pages/Tasks';
 import DataSourcesPage from '@/pages/DataSources';
 import SettingsPage from '@/pages/Settings';
+import SchedulesPage from '@/pages/Schedules';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, isLoading } = useAuth();
@@ -59,6 +60,7 @@ export default function App() {
                 <Route path="/knowledge" element={<KnowledgePage />} />
                 <Route path="/tasks" element={<TasksPage />} />
                 <Route path="/data-sources" element={<DataSourcesPage />} />
+                <Route path="/schedules" element={<SchedulesPage />} />
                 <Route path="/settings" element={<SettingsPage />} />
               </Route>
 

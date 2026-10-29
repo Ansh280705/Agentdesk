@@ -259,6 +259,29 @@ const MIGRATIONS: Array<{ name: string; sql: string }> = [
       CREATE INDEX IF NOT EXISTS idx_sessions_expires ON user_sessions(expires_at);
     `,
   },
+  {
+    name: '014_create_scheduled_jobs',
+    sql: `
+      CREATE TABLE IF NOT EXISTS scheduled_jobs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        agent_id UUID REFERENCES agents(id) ON DELETE SET NULL,
+        prompt TEXT NOT NULL,
+        cron_expression TEXT,
+        interval_minutes INTEGER,
+        is_active BOOLEAN DEFAULT TRUE,
+        last_run_at TIMESTAMPTZ,
+        next_run_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_scheduled_workspace ON scheduled_jobs(workspace_id);
+      CREATE INDEX IF NOT EXISTS idx_scheduled_user ON scheduled_jobs(user_id);
+      CREATE INDEX IF NOT EXISTS idx_scheduled_active ON scheduled_jobs(is_active, next_run_at);
+    `,
+  },
 ];
 
 async function runMigrations() {

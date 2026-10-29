@@ -22,6 +22,10 @@ const SendMessageSchema = z.object({
   agent_id: z.string().uuid().optional(),
 });
 
+const EditMessageSchema = z.object({
+  content: z.string().min(1).max(20000),
+});
+
 // List conversations (paginated)
 router.get('/', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const { userId, workspaceId } = req.user!;
@@ -224,6 +228,121 @@ router.post('/:id/messages/:msgId/feedback', async (req: AuthenticatedRequest, r
   );
 
   res.json({ message: 'Feedback recorded' });
+});
+
+// Edit message
+router.patch('/:id/messages/:msgId', validateBody(EditMessageSchema), async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const { userId, workspaceId } = req.user!;
+  const { content } = req.body as z.infer<typeof EditMessageSchema>;
+
+  // Verify ownership
+  const conv = await queryOne(
+    `SELECT id FROM conversations WHERE id = $1 AND workspace_id = $2 AND user_id = $3`,
+    [req.params['id'], workspaceId, userId]
+  );
+  if (!conv) {
+    res.status(404).json({ error: 'Conversation not found' });
+    return;
+  }
+
+  // Only allow editing user messages
+  const msg = await queryOne<{ role: string }>(
+    `SELECT role FROM messages WHERE id = $1 AND conversation_id = $2`,
+    [req.params['msgId'], req.params['id']]
+  );
+  if (!msg) {
+    res.status(404).json({ error: 'Message not found' });
+    return;
+  }
+  if (msg.role !== 'user') {
+    res.status(403).json({ error: 'Only user messages can be edited' });
+    return;
+  }
+
+  const updated = await queryOne(
+    `UPDATE messages SET content = $1 WHERE id = $2 AND conversation_id = $3 RETURNING id, content, role, created_at`,
+    [content, req.params['msgId'], req.params['id']]
+  );
+
+  res.json({ data: updated });
+});
+
+// Delete message (and all subsequent messages)
+router.delete('/:id/messages/:msgId', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const { userId, workspaceId } = req.user!;
+
+  const conv = await queryOne(
+    `SELECT id FROM conversations WHERE id = $1 AND workspace_id = $2 AND user_id = $3`,
+    [req.params['id'], workspaceId, userId]
+  );
+  if (!conv) {
+    res.status(404).json({ error: 'Conversation not found' });
+    return;
+  }
+
+  // Get the message to find its timestamp
+  const msg = await queryOne<{ created_at: string }>(
+    `SELECT created_at FROM messages WHERE id = $1 AND conversation_id = $2`,
+    [req.params['msgId'], req.params['id']]
+  );
+  if (!msg) {
+    res.status(404).json({ error: 'Message not found' });
+    return;
+  }
+
+  // Delete this message and ALL messages after it (effectively "re-run from here")
+  await query(
+    `DELETE FROM messages WHERE conversation_id = $1 AND created_at >= $2`,
+    [req.params['id'], msg.created_at]
+  );
+
+  // Update conversation timestamp
+  await query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [req.params['id']]);
+
+  res.json({ message: 'Message and subsequent messages deleted' });
+});
+
+// Regenerate response (delete last assistant response and re-run)
+router.post('/:id/regenerate', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const { userId, workspaceId } = req.user!;
+  const conv = await queryOne<{ id: string; agent_id: string }>(
+    `SELECT id, agent_id FROM conversations WHERE id = $1 AND workspace_id = $2 AND user_id = $3`,
+    [req.params['id'], workspaceId, userId]
+  );
+  if (!conv) {
+    res.status(404).json({ error: 'Conversation not found' });
+    return;
+  }
+
+  // Find the last user message
+  const lastUserMsg = await queryOne<{ id: string; content: string }>(
+    `SELECT id, content FROM messages WHERE conversation_id = $1 AND role = 'user' ORDER BY created_at DESC LIMIT 1`,
+    [req.params['id']]
+  );
+  if (!lastUserMsg) {
+    res.status(400).json({ error: 'No user message to regenerate from' });
+    return;
+  }
+
+  // Delete the last assistant message (if any)
+  await query(
+    `DELETE FROM messages WHERE conversation_id = $1 AND role = 'assistant' AND created_at >= (SELECT created_at FROM messages WHERE id = $2)`,
+    [req.params['id'], lastUserMsg.id]
+  );
+
+  // Delete the last user message (we'll re-add it via executeAgent)
+  await query(`DELETE FROM messages WHERE id = $1`, [lastUserMsg.id]);
+
+  // Re-run the agent
+  const result = await executeAgent({
+    conversationId: conv.id,
+    userId,
+    workspaceId,
+    agentId: conv.agent_id ?? undefined,
+    userMessage: lastUserMsg.content,
+  });
+
+  res.json({ data: result });
 });
 
 export default router;

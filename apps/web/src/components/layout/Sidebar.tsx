@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   MessageSquare, Bot, Database, BookOpen,
   FileText, ListTodo, Settings, LogOut,
-  Plus, Pencil, Check, X, Trash2,
+  Plus, Pencil, Check, X, Trash2, Clock,
 } from 'lucide-react';
 import { cn, truncate, timeAgo } from '@/lib/utils';
 import { useAuth } from '@/hooks/useAuth';
@@ -28,6 +28,7 @@ const NAV_SECTIONS = [
     items: [
       { to: '/artifacts', icon: FileText, label: 'Artifacts' },
       { to: '/tasks', icon: ListTodo, label: 'Tasks' },
+      { to: '/schedules', icon: Clock, label: 'Schedules' },
     ],
   },
 ];

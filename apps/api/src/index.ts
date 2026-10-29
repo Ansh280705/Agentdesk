@@ -22,6 +22,7 @@ import dashboardRoutes from './routes/dashboard';
 import settingsRoutes from './routes/settings';
 import dataSourceRoutes from './routes/datasources';
 import healthRouter from './routes/health';
+import scheduleRoutes from './routes/schedules';
 
 // Load builtin tools
 import './tools/builtin';
@@ -58,6 +59,7 @@ app.use('/api/tasks', taskRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/data-sources', dataSourceRoutes);
+app.use('/api/schedules', scheduleRoutes);
 
 // Global error handler
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
