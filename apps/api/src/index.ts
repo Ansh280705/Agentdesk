@@ -36,7 +36,13 @@ app.use(helmet({
 
 // CORS
 app.use(cors({
-  origin: [config.frontendUrl, 'http://localhost:5173', 'http://localhost:5174'],
+  origin: [
+    config.frontendUrl,
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'https://metals-threatening-lauren-tape.trycloudflare.com',
+    /\.trycloudflare\.com$/,
+  ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
