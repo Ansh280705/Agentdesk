@@ -47,8 +47,7 @@ router.get('/', async (req: AuthenticatedRequest, res: Response): Promise<void> 
       [workspaceId, userId]
     ),
     queryOne<{ count: number }>(
-      `SELECT COUNT(*)::int AS count FROM knowledge_documents WHERE workspace_id = $1 AND user_id = $2`,
-      [workspaceId, userId]
+      `SELECT COUNT(*)::int AS count FROM knowledge_documents`
     ),
     queryOne<{ count: number }>(
       `SELECT COUNT(*)::int AS count FROM usage_records

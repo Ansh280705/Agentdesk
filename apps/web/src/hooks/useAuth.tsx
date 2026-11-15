@@ -12,7 +12,7 @@ interface AuthState {
 
 interface AuthContextValue extends AuthState {
   login: (email: string, password: string) => Promise<void>;
-  register: (name: string, email: string, password: string) => Promise<void>;
+  register: (name: string, email: string, password: string, inviteCode?: string) => Promise<void>;
   logout: () => void;
   updatePreferences: (prefs: Partial<Preferences>) => Promise<void>;
 }
@@ -66,8 +66,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
-  const register = useCallback(async (name: string, email: string, password: string) => {
-    const { data } = await api.post('/auth/register', { name, email, password });
+  const register = useCallback(async (name: string, email: string, password: string, inviteCode?: string) => {
+    const { data } = await api.post('/auth/register', { name, email, password, invite_code: inviteCode || undefined });
     setAuthToken(data.token);
     localStorage.setItem('agentdesk_workspace', data.workspace.id);
     setState({

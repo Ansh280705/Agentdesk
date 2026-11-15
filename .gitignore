@@ -9,3 +9,4 @@ build/
 coverage/
 .nyc_output/
 *.tsbuildinfo
+vite.config.ts.timestamp-*.mjs

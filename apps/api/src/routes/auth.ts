@@ -14,6 +14,7 @@ const RegisterSchema = z.object({
   email: z.string().email().max(255),
   name: z.string().min(1).max(100),
   password: z.string().min(8).max(128),
+  invite_code: z.string().max(64).optional(),
 });
 
 const LoginSchema = z.object({
@@ -22,7 +23,7 @@ const LoginSchema = z.object({
 });
 
 router.post('/register', authRateLimiter, validateBody(RegisterSchema), async (req: Request, res: Response): Promise<void> => {
-  const { email, name, password } = req.body as z.infer<typeof RegisterSchema>;
+  const { email, name, password, invite_code } = req.body as z.infer<typeof RegisterSchema>;
 
   const existing = await queryOne('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
   if (existing) {
@@ -30,9 +31,28 @@ router.post('/register', authRateLimiter, validateBody(RegisterSchema), async (r
     return;
   }
 
+  // Resolve invite → join an existing workspace instead of creating one
+  let joinWorkspaceId: string | null = null;
+  let inviteId: string | null = null;
+  if (invite_code) {
+    const invite = await queryOne<{ id: string; workspace_id: string }>(
+      `SELECT id, workspace_id FROM workspace_invites
+       WHERE code = $1
+         AND (expires_at IS NULL OR expires_at > NOW())
+         AND (max_uses IS NULL OR use_count < max_uses)`,
+      [invite_code.trim()]
+    );
+    if (!invite) {
+      res.status(400).json({ error: 'Invalid or expired invite code' });
+      return;
+    }
+    joinWorkspaceId = invite.workspace_id;
+    inviteId = invite.id;
+  }
+
   const passwordHash = await argon2.hash(password);
   const userId = uuidv4();
-  const workspaceId = uuidv4();
+  const workspaceId = joinWorkspaceId ?? uuidv4();
   const slug = `${name.toLowerCase().replace(/[^a-z0-9]/g, '-')}-${userId.slice(0, 6)}`;
 
   // Create user, workspace, preferences in a transaction
@@ -42,15 +62,28 @@ router.post('/register', authRateLimiter, validateBody(RegisterSchema), async (r
       `INSERT INTO users (id, email, name, password_hash) VALUES ($1, $2, $3, $4)`,
       [userId, email.toLowerCase(), name, passwordHash]
     );
+    if (!joinWorkspaceId) {
+      await query(
+        `INSERT INTO workspaces (id, name, slug, owner_id) VALUES ($1, $2, $3, $4)`,
+        [workspaceId, `${name}'s Workspace`, slug, userId]
+      );
+    }
     await query(
-      `INSERT INTO workspaces (id, name, slug, owner_id) VALUES ($1, $2, $3, $4)`,
-      [workspaceId, `${name}'s Workspace`, slug, userId]
-    );
-    await query(
-      `INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')`,
-      [workspaceId, userId]
+      `INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)`,
+      [workspaceId, userId, joinWorkspaceId ? 'member' : 'owner']
     );
     await query(`INSERT INTO user_preferences (user_id) VALUES ($1)`, [userId]);
+    if (inviteId) {
+      await query(`UPDATE workspace_invites SET use_count = use_count + 1 WHERE id = $1`, [inviteId]);
+      // Auto-join public channels in the invited workspace
+      await query(
+        `INSERT INTO channel_members (id, conversation_id, user_id)
+         SELECT gen_random_uuid(), c.id, $2 FROM conversations c
+         WHERE c.workspace_id = $1 AND c.kind = 'channel' AND c.visibility = 'public'
+         ON CONFLICT DO NOTHING`,
+        [workspaceId, userId]
+      );
+    }
     await query('COMMIT');
   } catch (err) {
     await query('ROLLBACK');

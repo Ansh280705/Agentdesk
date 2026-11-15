@@ -1,5 +1,5 @@
 import { useState, FormEvent } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Zap } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { Input } from '@/components/ui/Input';
@@ -10,6 +10,8 @@ import toast from 'react-hot-toast';
 export default function RegisterPage() {
   const { register } = useAuth();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const inviteCode = searchParams.get('invite') ?? undefined;
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -25,7 +27,7 @@ export default function RegisterPage() {
     }
     setLoading(true);
     try {
-      await register(name, email, password);
+      await register(name, email, password, inviteCode);
       toast.success('Account created!');
       navigate('/dashboard');
     } catch (err) {
@@ -43,7 +45,9 @@ export default function RegisterPage() {
             <Zap className="h-6 w-6 text-white" />
           </div>
           <h1 className="text-2xl font-semibold text-gray-900 dark:text-gray-100">AgentDesk</h1>
-          <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">Create your workspace</p>
+          <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+            {inviteCode ? "You've been invited to join a workspace" : 'Create your workspace'}
+          </p>
         </div>
 
         <div className="bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 p-6 shadow-sm">

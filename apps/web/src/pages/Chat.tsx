@@ -1,16 +1,19 @@
-import { useState, useRef, useEffect, FormEvent } from 'react';
+import { useState, useRef, useEffect, FormEvent, KeyboardEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Send, StopCircle, Bot, MessageSquare } from 'lucide-react';
+import { Send, StopCircle, Bot, MessageSquare, Brain, Sparkles } from 'lucide-react';
 import { api } from '@/lib/api';
 import { Button } from '@/components/ui/Button';
 import { ChatMessage } from '@/features/chat/ChatMessage';
 import { AgentStatusBar } from '@/features/chat/AgentStatusBar';
+import { AgentProcess } from '@/features/chat/AgentProcess';
 import { InsightSuggestion } from '@/features/chat/InsightSuggestion';
 import { SkeletonText } from '@/components/ui/Skeleton';
 import { cn } from '@/lib/utils';
-import type { Message, Conversation, LearnedInsight } from '@/types';
+import type { Message, Conversation, LearnedInsight, Agent } from '@/types';
 import toast from 'react-hot-toast';
+
+const BRAIN_TAG = /\b@brain\b/i;
 
 export default function ChatPage() {
   const { id: conversationId } = useParams();
@@ -18,6 +21,11 @@ export default function ChatPage() {
   const qc = useQueryClient();
   const [input, setInput] = useState('');
   const [agentStatus, setAgentStatus] = useState<string | null>(null);
+  // @mention autocomplete state
+  const [mentionOpen, setMentionOpen] = useState(false);
+  const [mentionQuery, setMentionQuery] = useState('');
+  const [mentionStart, setMentionStart] = useState(-1);
+  const [mentionIdx, setMentionIdx] = useState(0);
   // Pending insight to show after last AI response
   const [pendingInsight, setPendingInsight] = useState<LearnedInsight | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -32,22 +40,81 @@ export default function ChatPage() {
     enabled: !!conversationId,
   });
 
-  // Load messages
+  // Conversation bound to a specific agent replies to every message
+  const boundAgentId = convData?.agent_id;
+  const { data: boundAgent } = useQuery({
+    queryKey: ['agent', boundAgentId],
+    queryFn: () => api.get(`/agents/${boundAgentId}`).then((r) => r.data.data as Agent),
+    enabled: !!boundAgentId,
+  });
+
+  // Load messages — poll while the agent is working so steps stream in live
   const { data: messagesData, isLoading: msgsLoading } = useQuery({
     queryKey: ['messages', conversationId],
     queryFn: () => conversationId
       ? api.get(`/conversations/${conversationId}/messages?per_page=100`).then((r) => r.data.data as Message[])
       : Promise.resolve([]),
     enabled: !!conversationId,
+    refetchInterval: agentStatus ? 1200 : false,
   });
+
+  // Workspace members for @mentions (includes Brain bot)
+  const { data: members } = useQuery({
+    queryKey: ['channel-users'],
+    queryFn: () => api.get('/channels/users').then((r) => r.data.data as Array<{ id: string; name: string; handle: string; is_bot: boolean }>),
+  });
+
+  const filteredMembers = (members ?? []).filter((m) =>
+    m.handle.toLowerCase().startsWith(mentionQuery.toLowerCase()) ||
+    m.name.toLowerCase().includes(mentionQuery.toLowerCase())
+  ).slice(0, 8);
+
+  const updateMention = (text: string, caret: number) => {
+    const before = text.slice(0, caret);
+    const at = before.lastIndexOf('@');
+    if (at !== -1 && (at === 0 || /\s/.test(before[at - 1]))) {
+      const q = before.slice(at + 1);
+      if (!/\s/.test(q)) {
+        setMentionOpen(true);
+        setMentionQuery(q);
+        setMentionStart(at);
+        setMentionIdx(0);
+        return;
+      }
+    }
+    setMentionOpen(false);
+  };
+
+  const pickMention = (m: { handle: string }) => {
+    const caret = textareaRef.current?.selectionStart ?? input.length;
+    setInput(`${input.slice(0, mentionStart)}@${m.handle} ${input.slice(caret)}`);
+    setMentionOpen(false);
+    textareaRef.current?.focus();
+  };
 
   const messages = messagesData ?? [];
 
+  // Group consecutive tool-call records + empty assistant turns into process runs.
+  // Also remember the user question that preceded each assistant answer (for "Save to Wiki").
+  const renderItems: Array<{ type: 'msg'; m: Message; promptText?: string } | { type: 'steps'; items: Message[] }> = [];
+  let lastUserContent = '';
+  for (const m of messages) {
+    const isStep = m.role === 'tool' || (m.role === 'assistant' && !(m.content ?? '').trim());
+    if (m.role === 'user') lastUserContent = m.content;
+    if (isStep) {
+      const last = renderItems[renderItems.length - 1];
+      if (last?.type === 'steps') last.items.push(m);
+      else renderItems.push({ type: 'steps', items: [m] });
+    } else {
+      renderItems.push({ type: 'msg', m, promptText: m.role === 'assistant' ? lastUserContent : undefined });
+    }
+  }
+
   // Send message mutation
   const sendMutation = useMutation({
-    mutationFn: async (content: string) => {
-      setAgentStatus('understanding');
-      const res = await api.post(`/conversations/${conversationId}/messages`, { content });
+    mutationFn: async (payload: { content: string; respond: boolean }) => {
+      if (payload.respond) setAgentStatus('understanding');
+      const res = await api.post(`/conversations/${conversationId}/messages`, payload);
       return res.data.data as {
         messageId: string;
         content: string;
@@ -106,7 +173,7 @@ export default function ChatPage() {
         qc.invalidateQueries({ queryKey: ['conversations'] });
         navigate(`/chat/${newId}`);
         setInput('');
-        sessionStorage.setItem('pending_message', content);
+        sessionStorage.setItem('pending_message', JSON.stringify({ content, respond: BRAIN_TAG.test(content) }));
       } catch {
         toast.error('Failed to create conversation');
       }
@@ -114,7 +181,7 @@ export default function ChatPage() {
     }
 
     setInput('');
-    sendMutation.mutate(content);
+    sendMutation.mutate({ content, respond: !!boundAgentId || BRAIN_TAG.test(content) });
   };
 
   // Handle pending message after navigation
@@ -123,13 +190,26 @@ export default function ChatPage() {
       const pending = sessionStorage.getItem('pending_message');
       if (pending) {
         sessionStorage.removeItem('pending_message');
-        setTimeout(() => sendMutation.mutate(pending), 100);
+        let payload: { content: string; respond: boolean };
+        try {
+          const parsed = JSON.parse(pending);
+          payload = typeof parsed === 'string' ? { content: parsed, respond: true } : parsed;
+        } catch {
+          payload = { content: pending, respond: true };
+        }
+        setTimeout(() => sendMutation.mutate(payload), 100);
       }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversationId]);
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (mentionOpen && filteredMembers.length > 0) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); setMentionIdx((i) => (i + 1) % filteredMembers.length); return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); setMentionIdx((i) => (i - 1 + filteredMembers.length) % filteredMembers.length); return; }
+      if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); pickMention(filteredMembers[mentionIdx]); return; }
+      if (e.key === 'Escape') { setMentionOpen(false); return; }
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSubmit();
@@ -138,18 +218,31 @@ export default function ChatPage() {
 
   const isLoading = sendMutation.isPending;
 
+  // Poll the engine's live status so the bar shows the actual current step
+  const { data: liveStatus } = useQuery({
+    queryKey: ['agent-status', conversationId],
+    queryFn: () => api.get(`/conversations/${conversationId}/status`).then((r) => r.data.data as { status: string; detail?: string } | null),
+    enabled: !!conversationId && isLoading,
+    refetchInterval: 800,
+  });
+
   return (
     <div className="flex flex-col flex-1 h-full">
         {/* Header */}
         {convData && (
-          <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950">
+          <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-200 dark:border-white/10 bg-white dark:bg-gray-950">
             <MessageSquare className="h-4 w-4 text-gray-400 flex-shrink-0" />
             <h2 className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">{convData.title}</h2>
+            {boundAgent && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300">
+                <Sparkles className="h-3 w-3" /> Agent: {boundAgent.name}
+              </span>
+            )}
           </div>
         )}
 
         {/* Messages */}
-        <div className="flex-1 overflow-y-auto">
+        <div className="flex-1 overflow-y-auto bg-white dark:bg-[#0d0d0f]">
           {!conversationId ? (
             <div className="flex flex-col items-center justify-center h-full gap-4 px-4">
               <div className="w-12 h-12 rounded-2xl bg-brand-100 dark:bg-brand-900/30 flex items-center justify-center">
@@ -182,13 +275,22 @@ export default function ChatPage() {
             </div>
           ) : (
             <div className="py-4 space-y-1">
-              {messages.map((msg) => (
-                <ChatMessage
-                  key={msg.id}
-                  message={msg}
-                  conversationId={conversationId!}
-                />
-              ))}
+              {renderItems.map((item, i) =>
+                item.type === 'steps' ? (
+                  <AgentProcess
+                    key={`steps-${i}`}
+                    steps={item.items}
+                    live={isLoading && i === renderItems.length - 1}
+                  />
+                ) : (
+                  <ChatMessage
+                    key={item.m.id}
+                    message={item.m}
+                    conversationId={conversationId!}
+                    promptText={item.promptText}
+                  />
+                )
+              )}
 
               {/* Insight suggestion — shown at bottom after last response */}
               {pendingInsight && !isLoading && (
@@ -198,34 +300,42 @@ export default function ChatPage() {
                 />
               )}
 
-              {isLoading && agentStatus && (
-                <AgentStatusBar status={agentStatus} />
-              )}
-              {isLoading && !agentStatus && (
-                <div className="flex gap-3 px-4 py-3">
-                  <div className="w-7 h-7 rounded-full bg-gray-200 dark:bg-gray-700 flex items-center justify-center text-xs">A</div>
-                  <div className="flex items-center gap-1 mt-1">
-                    <span className="w-2 h-2 rounded-full bg-gray-400 animate-bounce" style={{ animationDelay: '0ms' }} />
-                    <span className="w-2 h-2 rounded-full bg-gray-400 animate-bounce" style={{ animationDelay: '150ms' }} />
-                    <span className="w-2 h-2 rounded-full bg-gray-400 animate-bounce" style={{ animationDelay: '300ms' }} />
-                  </div>
-                </div>
-              )}
+              {isLoading && <AgentStatusBar status={liveStatus?.status ?? agentStatus ?? 'understanding'} detail={liveStatus?.detail} />}
               <div ref={messagesEndRef} />
             </div>
           )}
         </div>
 
         {/* Input */}
-        <div className="border-t border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 p-4">
+        <div className="border-t border-gray-200 dark:border-white/10 bg-white dark:bg-gray-950 p-4">
           <form onSubmit={handleSubmit} className="flex gap-2 items-end">
-            <div className="flex-1 rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 focus-within:border-brand-500 focus-within:ring-1 focus-within:ring-brand-500 transition-all">
-              <textarea
-                ref={textareaRef}
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="Message your AI coworker… (Enter to send, Shift+Enter for newline)"
+            <div className="relative flex-1">
+              {mentionOpen && filteredMembers.length > 0 && (
+                <div className="absolute bottom-full left-0 mb-1 w-64 max-h-48 overflow-y-auto rounded-lg border border-gray-200 dark:border-white/10 bg-white dark:bg-gray-800 shadow-lg z-10 animate-pop-in">
+                  {filteredMembers.map((m, i) => (
+                    <button
+                      key={m.id} type="button"
+                      onMouseDown={(e) => { e.preventDefault(); pickMention(m); }}
+                      className={cn('w-full flex items-center gap-2 px-3 py-2 text-left text-sm transition-colors',
+                        i === mentionIdx ? 'bg-indigo-100 dark:bg-indigo-800' : 'hover:bg-gray-100 dark:hover:bg-gray-800')}
+                    >
+                      <span className={cn('w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-semibold flex-shrink-0',
+                        m.is_bot ? 'bg-gradient-to-br from-brand-400 to-brand-700 text-white' : 'bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-300')}>
+                        {m.is_bot ? <Brain className="h-3 w-3" /> : m.name.charAt(0).toUpperCase()}
+                      </span>
+                      <span className="flex-1 truncate text-gray-900 dark:text-gray-100">{m.name}</span>
+                      <span className="text-xs text-gray-400">@{m.handle}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div className="rounded-xl border border-gray-200 dark:border-white/10 bg-white dark:bg-white/5 focus-within:border-indigo-500 focus-within:ring-1 focus-within:ring-indigo-500/50 transition-all">
+                <textarea
+                  ref={textareaRef}
+                  value={input}
+                  onChange={(e) => { setInput(e.target.value); updateMention(e.target.value, e.target.selectionStart ?? e.target.value.length); }}
+                  onKeyDown={handleKeyDown}
+                  placeholder={boundAgent ? `Message ${boundAgent.name}…` : 'Message your AI coworker… (type @brain to ask the AI)'}
                 disabled={isLoading}
                 rows={1}
                 className={cn(
@@ -235,12 +345,13 @@ export default function ChatPage() {
                 )}
               />
             </div>
+            </div>
             {isLoading ? (
-              <Button type="button" variant="secondary" size="icon" onClick={() => sendMutation.reset()} title="Stop">
+              <Button type="button" variant="secondary" size="icon" onClick={() => sendMutation.reset()} title="Stop" className="active:scale-90 transition-transform">
                 <StopCircle className="h-4 w-4" />
               </Button>
             ) : (
-              <Button type="submit" size="icon" disabled={!input.trim()} title="Send (Enter)">
+              <Button type="submit" size="icon" disabled={!input.trim()} title="Send (Enter)" className="active:scale-90 transition-transform">
                 <Send className="h-4 w-4" />
               </Button>
             )}

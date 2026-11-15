@@ -21,6 +21,10 @@ import taskRoutes from './routes/tasks';
 import dashboardRoutes from './routes/dashboard';
 import settingsRoutes from './routes/settings';
 import dataSourceRoutes from './routes/datasources';
+import roomRoutes from './routes/room';
+import channelRoutes from './routes/channels';
+import inviteRoutes from './routes/invites';
+import presenceRoutes from './routes/presence';
 import healthRouter from './routes/health';
 import scheduleRoutes from './routes/schedules';
 
@@ -65,6 +69,10 @@ app.use('/api/tasks', taskRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/data-sources', dataSourceRoutes);
+app.use('/api/room', roomRoutes);
+app.use('/api/channels', channelRoutes);
+app.use('/api/invites', inviteRoutes);
+app.use('/api/presence', presenceRoutes);
 app.use('/api/schedules', scheduleRoutes);
 
 // Global error handler

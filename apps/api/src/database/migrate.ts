@@ -282,6 +282,99 @@ const MIGRATIONS: Array<{ name: string; sql: string }> = [
       CREATE INDEX IF NOT EXISTS idx_scheduled_active ON scheduled_jobs(is_active, next_run_at);
     `,
   },
+  {
+    name: '015_shared_conversations',
+    sql: `
+      ALTER TABLE conversations ADD COLUMN IF NOT EXISTS is_shared BOOLEAN DEFAULT FALSE;
+      CREATE INDEX IF NOT EXISTS idx_conversations_shared ON conversations(workspace_id, is_shared);
+    `,
+  },
+  {
+    name: '016_message_user_id',
+    sql: `
+      ALTER TABLE messages ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE SET NULL;
+      CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id);
+    `,
+  },
+  {
+    name: '017_channel_columns',
+    sql: `
+      ALTER TABLE conversations
+        ADD COLUMN IF NOT EXISTS kind TEXT DEFAULT 'ai',
+        ADD COLUMN IF NOT EXISTS name TEXT,
+        ADD COLUMN IF NOT EXISTS visibility TEXT DEFAULT 'private',
+        ADD COLUMN IF NOT EXISTS created_by UUID;
+      -- The existing shared room becomes the #general public channel
+      UPDATE conversations SET kind='channel', name='general', visibility='public', created_by=user_id
+        WHERE is_shared = TRUE;
+      CREATE INDEX IF NOT EXISTS idx_conversations_kind ON conversations(workspace_id, kind);
+    `,
+  },
+  {
+    name: '018_channel_members',
+    sql: `
+      CREATE TABLE IF NOT EXISTS channel_members (
+        id UUID PRIMARY KEY,
+        conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT DEFAULT 'member',
+        last_read_at TIMESTAMPTZ DEFAULT '1970-01-01',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(conversation_id, user_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_channel_members_user ON channel_members(user_id);
+      CREATE INDEX IF NOT EXISTS idx_channel_members_conv ON channel_members(conversation_id);
+      -- Seed: every workspace member joins existing public channels
+      INSERT INTO channel_members (id, conversation_id, user_id)
+      SELECT gen_random_uuid(), c.id, wm.user_id
+      FROM conversations c
+      JOIN workspace_members wm ON wm.workspace_id = c.workspace_id
+      WHERE c.kind = 'channel' AND c.visibility = 'public'
+      ON CONFLICT DO NOTHING;
+    `,
+  },
+  {
+    name: '019_message_mentions',
+    sql: `
+      CREATE TABLE IF NOT EXISTS message_mentions (
+        id UUID PRIMARY KEY,
+        message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        channel_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        mentioned_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        read_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_mentions_user ON message_mentions(mentioned_user_id, read_at);
+      CREATE INDEX IF NOT EXISTS idx_mentions_msg ON message_mentions(message_id);
+    `,
+  },
+  {
+    name: '020_invites_reactions',
+    sql: `
+      CREATE TABLE IF NOT EXISTS workspace_invites (
+        id UUID PRIMARY KEY,
+        workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+        code TEXT NOT NULL UNIQUE,
+        created_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        max_uses INT,
+        use_count INT DEFAULT 0,
+        expires_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_invites_workspace ON workspace_invites(workspace_id);
+      CREATE INDEX IF NOT EXISTS idx_invites_code ON workspace_invites(code);
+
+      CREATE TABLE IF NOT EXISTS message_reactions (
+        id UUID PRIMARY KEY,
+        message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        emoji TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(message_id, user_id, emoji)
+      );
+      CREATE INDEX IF NOT EXISTS idx_reactions_msg ON message_reactions(message_id);
+    `,
+  },
 ];
 
 async function runMigrations() {

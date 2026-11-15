@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { ThumbsUp, ThumbsDown, Copy, Check, Wrench, AlertCircle, Pencil, RefreshCw, X } from 'lucide-react';
+import { ThumbsUp, ThumbsDown, Copy, Check, Wrench, AlertCircle, Pencil, RefreshCw, X, Brain, BookOpen } from 'lucide-react';
 import { cn, timeAgo } from '@/lib/utils';
 import { api } from '@/lib/api';
 import { useQueryClient, useMutation } from '@tanstack/react-query';
@@ -14,14 +14,17 @@ interface ChatMessageProps {
   message: Message;
   conversationId: string;
   onFeedback?: (msgId: string, feedback: 'up' | 'down') => void;
+  /** The user question that triggered this answer — used for "Save to Wiki" title */
+  promptText?: string;
 }
 
-export function ChatMessage({ message, conversationId, onFeedback }: ChatMessageProps) {
+export function ChatMessage({ message, conversationId, onFeedback, promptText }: ChatMessageProps) {
   const qc = useQueryClient();
   const [copied, setCopied] = useState(false);
   const [feedback, setFeedback] = useState<'up' | 'down' | null>(message.feedback ?? null);
   const [editing, setEditing] = useState(false);
   const [editContent, setEditContent] = useState(message.content);
+  const [wikiSaved, setWikiSaved] = useState(false);
 
   const isUser = message.role === 'user';
   const isAssistant = message.role === 'assistant';
@@ -55,6 +58,23 @@ export function ChatMessage({ message, conversationId, onFeedback }: ChatMessage
     onError: () => toast.error('Failed to update message'),
   });
 
+  // Save this answer to the workspace knowledge wiki
+  const wikiMutation = useMutation({
+    mutationFn: () => {
+      const q = (promptText ?? '').replace(/\s+/g, ' ').trim();
+      const title = q ? `Q&A: ${q.slice(0, 110)}` : `Brain answer — ${new Date().toLocaleDateString()}`;
+      const content = q
+        ? `**Question:** ${q}\n\n**Answer:**\n${message.content}`
+        : message.content;
+      return api.post('/knowledge', { title, content, type: 'note', tags: ['wiki', 'chat'] });
+    },
+    onSuccess: () => {
+      setWikiSaved(true);
+      toast.success('Saved to wiki');
+    },
+    onError: () => toast.error('Could not save to wiki'),
+  });
+
   // Regenerate from this point
   const regenerateMutation = useMutation({
     mutationFn: () => api.post(`/conversations/${conversationId}/regenerate`),
@@ -84,12 +104,12 @@ export function ChatMessage({ message, conversationId, onFeedback }: ChatMessage
     <div className={cn('group flex gap-3 px-4 py-3', isUser && 'flex-row-reverse')}>
       {/* Avatar */}
       <div className={cn(
-        'w-7 h-7 rounded-full flex items-center justify-center text-xs font-semibold flex-shrink-0 mt-0.5',
+        'w-7 h-7 rounded-full flex items-center justify-center text-xs font-semibold flex-shrink-0 mt-0.5 shadow-sm',
         isUser
-          ? 'bg-[#4e8c6b] text-white'
-          : 'bg-[#27272a] text-gray-300'
+          ? 'bg-indigo-600 text-white'
+          : 'bg-gradient-to-br from-brand-400 to-brand-700 text-white'
       )}>
-        {isUser ? 'U' : 'A'}
+        {isUser ? 'U' : <Brain className="h-3.5 w-3.5" />}
       </div>
 
       {/* Content */}
@@ -105,7 +125,7 @@ export function ChatMessage({ message, conversationId, onFeedback }: ChatMessage
                 if (e.key === 'Escape') { setEditing(false); setEditContent(message.content); }
                 if (e.key === 'Enter' && e.ctrlKey) editMutation.mutate();
               }}
-              className="w-full rounded-xl border border-[#4e8c6b] bg-[#1a1a1a] text-gray-100 px-3 py-2 text-sm resize-none focus:outline-none focus:ring-1 focus:ring-[#4e8c6b] min-h-[80px]"
+              className="w-full rounded-xl border border-indigo-500 bg-white/5 dark:bg-[#1a1a1a] text-gray-900 dark:text-gray-100 px-3 py-2 text-sm resize-none focus:outline-none focus:ring-1 focus:ring-indigo-500 min-h-[80px]"
             />
             <div className="flex gap-2 mt-2 justify-end">
               <Button variant="ghost" size="sm" onClick={() => { setEditing(false); setEditContent(message.content); }}>
@@ -121,11 +141,11 @@ export function ChatMessage({ message, conversationId, onFeedback }: ChatMessage
             <div className={cn(
               'max-w-[85%] rounded-2xl px-4 py-3 text-sm',
               isUser
-                ? 'bg-[#27272a] text-gray-100 rounded-tr-sm'
-                : 'bg-[#1e1e1e] border border-[#27272a] text-gray-100 rounded-tl-sm'
+                ? 'bg-indigo-600 text-white rounded-tr-sm'
+                : 'bg-white/[0.05] border border-white/10 text-gray-100 rounded-tl-sm'
             )}>
               {isAssistant ? (
-                <div className="prose prose-sm prose-invert max-w-none prose-pre:bg-[#0f0f0f] prose-pre:text-gray-100 prose-code:text-[#8dbea5]">
+                <div className="prose prose-sm prose-invert max-w-none prose-pre:bg-black/30 prose-pre:text-gray-100 prose-code:text-indigo-300">
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
                 </div>
               ) : (
@@ -169,6 +189,14 @@ export function ChatMessage({ message, conversationId, onFeedback }: ChatMessage
                     title="Copy"
                   >
                     {copied ? <Check className="h-3 w-3 text-green-400" /> : <Copy className="h-3 w-3" />}
+                  </button>
+                  <button
+                    onClick={() => !wikiSaved && wikiMutation.mutate()}
+                    className={cn('p-1 rounded transition-colors', wikiSaved ? 'text-green-400' : 'text-gray-500 hover:text-gray-300 hover:bg-[#27272a]')}
+                    title={wikiSaved ? 'Saved to wiki' : 'Save to wiki'}
+                    disabled={wikiMutation.isPending || wikiSaved}
+                  >
+                    {wikiSaved ? <Check className="h-3 w-3" /> : <BookOpen className="h-3 w-3" />}
                   </button>
                   <button
                     onClick={() => regenerateMutation.mutate()}

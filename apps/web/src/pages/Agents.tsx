@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Plus, Bot, Trash2, Copy, ToggleLeft, ToggleRight, Pencil } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { Plus, Bot, Trash2, Copy, ToggleLeft, ToggleRight, Pencil, MessageSquare } from 'lucide-react';
 import { api } from '@/lib/api';
 import { Button } from '@/components/ui/Button';
 import { Badge } from '@/components/ui/Badge';
@@ -38,6 +39,19 @@ export default function AgentsPage() {
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['agents'] }); toast.success('Agent duplicated'); },
   });
 
+  const navigate = useNavigate();
+  const chatMutation = useMutation({
+    mutationFn: async (agent: Agent) => {
+      const res = await api.post('/conversations', { title: agent.name, agent_id: agent.id });
+      return res.data.data.id as string;
+    },
+    onSuccess: (id) => {
+      qc.invalidateQueries({ queryKey: ['conversations'] });
+      navigate(`/chat/${id}`);
+    },
+    onError: () => toast.error('Failed to start chat'),
+  });
+
   const templates = data?.filter((a) => a.is_template) ?? [];
   const custom = data?.filter((a) => !a.is_template) ?? [];
 
@@ -72,6 +86,8 @@ export default function AgentsPage() {
                       onDelete={() => deleteMutation.mutate(agent.id)}
                       onToggle={() => toggleMutation.mutate(agent.id)}
                       onDuplicate={() => duplicateMutation.mutate(agent.id)}
+                      onChat={() => chatMutation.mutate(agent)}
+                      chatPending={chatMutation.isPending}
                     />
                   ))}
                 </div>
@@ -97,6 +113,8 @@ export default function AgentsPage() {
                       onDelete={() => deleteMutation.mutate(agent.id)}
                       onToggle={() => toggleMutation.mutate(agent.id)}
                       onDuplicate={() => duplicateMutation.mutate(agent.id)}
+                      onChat={() => chatMutation.mutate(agent)}
+                      chatPending={chatMutation.isPending}
                     />
                   ))}
                 </div>
@@ -115,12 +133,14 @@ export default function AgentsPage() {
   );
 }
 
-function AgentCard({ agent, onEdit, onDelete, onToggle, onDuplicate }: {
+function AgentCard({ agent, onEdit, onDelete, onToggle, onDuplicate, onChat, chatPending }: {
   agent: Agent;
   onEdit: () => void;
   onDelete: () => void;
   onToggle: () => void;
   onDuplicate: () => void;
+  onChat: () => void;
+  chatPending: boolean;
 }) {
   return (
     <Card>
@@ -152,7 +172,15 @@ function AgentCard({ agent, onEdit, onDelete, onToggle, onDuplicate }: {
         </div>
 
         <div className="flex items-center gap-1 pt-1 border-t border-gray-100 dark:border-gray-800">
-          <Button variant="ghost" size="sm" onClick={onEdit} className="flex-1 text-xs">
+          <Button
+            variant="ghost" size="sm" onClick={onChat}
+            disabled={!agent.is_enabled || chatPending}
+            className="flex-1 text-xs text-brand-600 dark:text-brand-400"
+            title={agent.is_enabled ? 'Start a chat with this agent' : 'Enable the agent to chat'}
+          >
+            <MessageSquare className="h-3 w-3" /> Chat
+          </Button>
+          <Button variant="ghost" size="sm" onClick={onEdit} className="text-xs">
             <Pencil className="h-3 w-3" /> Edit
           </Button>
           <Button variant="ghost" size="sm" onClick={onToggle} className="text-xs">

@@ -1,6 +1,17 @@
 import { z } from 'zod';
 import { registry, ToolDefinition } from './registry';
 import { query } from '../database/pool';
+import { runReadOnlyQuery, listTables, isReadOnlyQuery } from '../connectors/postgres';
+import { toOrTsQuery } from '../utils/search';
+
+// config_encrypted is stored as a JSON string in a TEXT column
+function parseSecretConfig(raw: unknown): Record<string, string> {
+  if (!raw) return {};
+  if (typeof raw === 'string') {
+    try { return JSON.parse(raw) as Record<string, string>; } catch { return {}; }
+  }
+  return raw as Record<string, string>;
+}
 
 function makeTool<TInput, TOutput>(def: {
   name: string;
@@ -123,23 +134,36 @@ registry.register(
     groqRequired: ['query'],
     async handler({ query: q, limit }, ctx) {
       try {
-        const results = await query<{
+        type Row = {
           id: string;
           title: string;
           content: string;
           type: string;
           tags: string[];
           rank: number;
-        }>(
+        };
+        // Strict AND first; fall back to OR-ed terms for natural-language questions
+        let results = await query<Row>(
           `SELECT id, title, content, type, tags,
                   ts_rank(search_vector, plainto_tsquery('english', $1)) AS rank
            FROM knowledge_documents
-           WHERE workspace_id = $2
-             AND search_vector @@ plainto_tsquery('english', $1)
+           WHERE search_vector @@ plainto_tsquery('english', $1)
            ORDER BY rank DESC
-           LIMIT $3`,
-          [q, ctx.workspaceId, limit]
+           LIMIT $2`,
+          [q, limit]
         );
+        const orQuery = toOrTsQuery(q);
+        if (!results.length && orQuery) {
+          results = await query<Row>(
+            `SELECT id, title, content, type, tags,
+                    ts_rank(search_vector, to_tsquery('english', $1)) AS rank
+             FROM knowledge_documents
+             WHERE search_vector @@ to_tsquery('english', $1)
+             ORDER BY rank DESC
+             LIMIT $2`,
+            [orQuery, limit]
+          );
+        }
         return {
           query: q,
           count: results.length,
@@ -193,38 +217,178 @@ registry.register(
 registry.register(
   makeTool({
     name: 'query_connected_data',
-    description: 'Queries data from a connected data source by its ID. Returns rows of data.',
+    description: 'Queries data from a connected data source by its ID. Returns actual rows of data from the source.',
     inputSchema: z.object({
-      source_id: z.string().uuid().describe('ID of the data source to query'),
+      source_id: z.string().min(1).describe('ID (UUID) or name of the data source to query'),
       description: z.string().max(500).describe('What data you want to retrieve'),
+      sql: z.string().max(2000).optional().describe('Read-only SELECT statement for postgres_readonly sources. Omit to get the schema.'),
       limit: z.number().int().min(1).max(100).optional().default(20),
     }),
     permissions: ['data_sources:read'],
-    timeoutMs: 10000,
+    timeoutMs: 15000,
     groqProperties: {
-      source_id: { type: 'string', description: 'UUID of the data source' },
+      source_id: { type: 'string', description: 'UUID or name of the data source (from list_available_data_sources)' },
       description: { type: 'string', description: 'What data to retrieve' },
+      sql: { type: 'string', description: 'Optional read-only SELECT statement (postgres sources only). Omit to list available tables.' },
       limit: { type: 'integer', description: 'Max rows to return', minimum: 1, maximum: 100 },
     },
     groqRequired: ['source_id', 'description'],
-    async handler({ source_id, description, limit }, ctx) {
-      // Verify ownership
-      const source = await query<{ id: string; name: string; type: string; config_public: Record<string, unknown> }>(
-        `SELECT id, name, type, config_public FROM data_sources
-         WHERE id = $1 AND workspace_id = $2 AND user_id = $3 AND status = 'connected'`,
-        [source_id, ctx.workspaceId, ctx.userId]
+    async handler({ source_id, description, sql, limit }, ctx) {
+      // Resolve by UUID or by name — models sometimes mangle long IDs
+      const source = await query<{
+        id: string; name: string; type: string;
+        config_public: Record<string, string>;
+        config_encrypted: unknown;
+      }>(
+        `SELECT id, name, type, config_public, config_encrypted FROM data_sources
+         WHERE workspace_id = $2 AND user_id = $3 AND status = 'connected'
+           AND (id::text = $1 OR name ILIKE '%' || $1 || '%')
+         ORDER BY (id::text = $1) DESC
+         LIMIT 1`,
+        [source_id.trim(), ctx.workspaceId, ctx.userId]
       );
 
       if (source.length === 0) {
-        return { error: 'Data source not found or not connected' };
+        const available = await query<{ name: string }>(
+          `SELECT name FROM data_sources WHERE workspace_id = $1 AND user_id = $2 AND status = 'connected'`,
+          [ctx.workspaceId, ctx.userId]
+        );
+        return {
+          error: `No connected data source matches "${source_id}".`,
+          available_sources: available.map((s) => s.name),
+          hint: 'Retry with an exact source name, or call list_available_data_sources to get IDs.',
+        };
+      }
+
+      const src = source[0];
+
+      // JSON API — actually fetch the data
+      if (src.type === 'json_api') {
+        const url = src.config_public['url'];
+        if (!url) return { error: 'URL not configured for this data source' };
+        try {
+          const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+          if (!resp.ok) return { error: `HTTP ${resp.status} from data source` };
+          const raw = await resp.json() as unknown;
+          const data = Array.isArray(raw) ? raw.slice(0, limit) : [raw];
+          return {
+            source_name: src.name,
+            source_type: src.type,
+            description,
+            row_count: data.length,
+            columns: data.length > 0 ? Object.keys(data[0] as Record<string, unknown>) : [],
+            rows: data,
+          };
+        } catch (err) {
+          return { error: 'Failed to fetch data: ' + (err instanceof Error ? err.message : 'Unknown') };
+        }
+      }
+
+      // CSV data stored in config
+      if (src.type === 'csv_upload') {
+        const csvContent = src.config_public['csv_data'];
+        if (!csvContent) {
+          // Return sample data from config description
+          return {
+            source_name: src.name,
+            source_type: src.type,
+            description: src.config_public['description'] ?? '',
+            message: 'CSV data not yet uploaded. Use the Data Sources page to upload a file.',
+            sample_note: description,
+          };
+        }
+        // Parse CSV
+        const lines = csvContent.trim().split('\n');
+        const headers = lines[0].split(',').map((h: string) => h.trim().replace(/^"|"$/g, ''));
+        const rows = lines.slice(1, (limit ?? 20) + 1).map((line: string) => {
+          const vals = line.split(',').map((v: string) => v.trim().replace(/^"|"$/g, ''));
+          return Object.fromEntries(headers.map((h: string, i: number) => [h, vals[i] ?? '']));
+        });
+        return {
+          source_name: src.name,
+          source_type: src.type,
+          description,
+          row_count: rows.length,
+          columns: headers,
+          rows,
+        };
+      }
+
+      // Google Sheets — fetch public CSV export (or a direct csv_url)
+      if (src.type === 'google_sheets') {
+        const sheetId = src.config_public['spreadsheet_id'];
+        const gid = src.config_public['gid'] ?? '0';
+        const csvUrl = src.config_public['csv_url']
+          ?? (sheetId ? `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv&gid=${gid}` : null);
+        if (!csvUrl) return { error: 'Spreadsheet ID or CSV URL not configured' };
+        try {
+          const resp = await fetch(csvUrl, { signal: AbortSignal.timeout(8000) });
+          if (!resp.ok) {
+            return { error: `Could not fetch sheet (is it public?): HTTP ${resp.status}` };
+          }
+          const csv = await resp.text();
+          const lines = csv.trim().split('\n');
+          const headers = lines[0].split(',').map((h: string) => h.trim().replace(/^"|"$/g, ''));
+          const rows = lines.slice(1, (limit ?? 20) + 1).map((line: string) => {
+            const vals = line.split(',').map((v: string) => v.trim().replace(/^"|"$/g, ''));
+            return Object.fromEntries(headers.map((h: string, i: number) => [h, vals[i] ?? '']));
+          });
+          return {
+            source_name: src.name,
+            source_type: src.type,
+            description,
+            row_count: rows.length,
+            total_rows: lines.length - 1,
+            columns: headers,
+            rows,
+          };
+        } catch (err) {
+          return { error: 'Failed to fetch sheet: ' + (err instanceof Error ? err.message : 'Unknown') };
+        }
+      }
+
+      // PostgreSQL — real read-only queries via connection_string
+      if (src.type === 'postgres_readonly') {
+        const connStr = parseSecretConfig(src.config_encrypted)['connection_string']
+          ?? src.config_public['connection_string'];
+        if (!connStr) {
+          return { error: 'PostgreSQL connection_string not configured for this source.' };
+        }
+        const rowLimit = limit ?? 20;
+        try {
+          // No SQL → return schema so the agent can build a query
+          if (!sql) {
+            const tables = await listTables(connStr);
+            return {
+              source_name: src.name,
+              source_type: src.type,
+              description,
+              schema: tables,
+              hint: 'Call this tool again with a `sql` SELECT statement to retrieve rows.',
+            };
+          }
+          if (!isReadOnlyQuery(sql)) {
+            return { error: 'Only read-only SELECT queries are allowed on connected data sources.' };
+          }
+          const result = await runReadOnlyQuery(connStr, sql, rowLimit);
+          return {
+            source_name: src.name,
+            source_type: src.type,
+            description,
+            sql,
+            row_count: result.rowCount,
+            rows: result.rows,
+          };
+        } catch (err) {
+          return { error: 'PostgreSQL query failed: ' + (err instanceof Error ? err.message : 'Unknown') };
+        }
       }
 
       return {
-        source_name: source[0].name,
-        source_type: source[0].type,
+        source_name: src.name,
+        source_type: src.type,
         description,
-        message: 'Data source found but real-time querying requires connector implementation for this source type.',
-        sample_note: 'Connect a Google Sheets or CSV source to query real data.',
+        message: `Connector type "${src.type}" requires additional setup. See Data Sources page.`,
       };
     },
   })

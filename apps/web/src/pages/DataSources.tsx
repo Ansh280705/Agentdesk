@@ -130,9 +130,21 @@ function AddSourceDialog({ open, onClose, connectors }: { open: boolean; onClose
   const [type, setType] = useState('json_api');
   const [name, setName] = useState('');
   const [url, setUrl] = useState('');
+  const [connectionString, setConnectionString] = useState('');
+  const [spreadsheetId, setSpreadsheetId] = useState('');
+  const [csvUrl, setCsvUrl] = useState('');
 
   const mutation = useMutation({
-    mutationFn: () => api.post('/data-sources', { name, type, config: { url } }),
+    mutationFn: () => {
+      const config: Record<string, string> = {};
+      if (type === 'json_api') config.url = url;
+      if (type === 'postgres_readonly') config.connection_string = connectionString;
+      if (type === 'google_sheets') {
+        if (spreadsheetId) config.spreadsheet_id = spreadsheetId;
+        else if (csvUrl) config.csv_url = csvUrl;
+      }
+      return api.post('/data-sources', { name, type, config });
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['data-sources'] });
       toast.success('Data source added');
@@ -154,10 +166,17 @@ function AddSourceDialog({ open, onClose, connectors }: { open: boolean; onClose
         {type === 'json_api' && (
           <Input label="API URL" type="url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://api.example.com/data" required />
         )}
-        {(type === 'google_sheets' || type === 'postgres_readonly') && (
-          <div className="rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 px-3 py-2.5 text-sm text-amber-700 dark:text-amber-400">
-            This connector requires additional setup. After adding, click "Test connection" and follow the instructions.
-          </div>
+        {type === 'postgres_readonly' && (
+          <Input label="Connection string" type="password" value={connectionString} onChange={(e) => setConnectionString(e.target.value)} placeholder="postgresql://user:pass@host/db?sslmode=require" required />
+        )}
+        {type === 'google_sheets' && (
+          <>
+            <Input label="Spreadsheet ID" value={spreadsheetId} onChange={(e) => setSpreadsheetId(e.target.value)} placeholder="1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms" />
+            <Input label="— or — Public CSV URL" type="url" value={csvUrl} onChange={(e) => setCsvUrl(e.target.value)} placeholder="https://example.com/data.csv" />
+            <div className="rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 px-3 py-2.5 text-sm text-amber-700 dark:text-amber-400">
+              The sheet must be shared as "Anyone with the link can view". The ID is in the sheet URL between /d/ and /edit.
+            </div>
+          </>
         )}
         <div className="flex gap-2">
           <Button type="button" variant="outline" onClick={onClose} className="flex-1">Cancel</Button>

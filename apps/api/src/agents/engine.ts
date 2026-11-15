@@ -10,6 +10,8 @@ export interface AgentExecutionOptions {
   workspaceId: string;
   agentId?: string;
   userMessage: string;
+  /** Skip inserting the user message — caller already saved it (shared rooms). */
+  skipUserInsert?: boolean;
   onStatus?: (status: string, detail?: string) => void;
   onChunk?: (chunk: string) => void;
 }
@@ -126,20 +128,36 @@ If truly nothing is worth saving: respond with exactly: null`,
   }
 }
 
+/** Live status of currently-running agent executions, keyed by conversation. */
+export const agentRunStatus = new Map<string, { status: string; detail?: string; at: number }>();
+
 export async function executeAgent(opts: AgentExecutionOptions): Promise<AgentExecutionResult> {
   const { conversationId, userId, workspaceId, agentId, userMessage, onStatus, onChunk } = opts;
 
   const notify = (status: string, detail?: string) => {
+    agentRunStatus.set(conversationId, { status, detail, at: Date.now() });
     onStatus?.(status, detail);
   };
 
   notify('understanding');
 
   // Load agent config
-  let systemPrompt = 'You are a helpful AI assistant called AgentDesk. Be concise, accurate, and helpful.';
-  let allowedTools = ['get_current_datetime', 'calculator', 'search_knowledge'];
+  let systemPrompt = `You are a helpful AI coworker called AgentDesk. You help users analyze data, answer questions, and get work done.
+
+WORKFLOW:
+1. First call search_knowledge with the user's question — the user saves previous answers to their wiki. If a saved answer covers the question well, reply with it and mention it's from their wiki.
+2. If the saved answer might be stale (the user asks for "latest", "current", "this month", etc.) or the knowledge base has nothing relevant, then gather fresh data: call list_available_data_sources, then query_connected_data with the source name.
+3. For live data questions, always use query_connected_data — never invent numbers.
+
+Keep tool calls minimal — avoid repeating the same query with slightly different phrasing.`;
+  let allowedTools = [
+    'get_current_datetime', 'calculator', 'search_knowledge',
+    'list_available_data_sources', 'query_connected_data',
+    'generate_chart', 'create_markdown_report', 'create_csv_export',
+    'retrieve_task_status',
+  ];
   let maxToolCalls = 10;
-  let maxIterations = 5;
+  let maxIterations = 8;
   let model = config.groqModel;
 
   if (agentId) {
@@ -163,20 +181,21 @@ export async function executeAgent(opts: AgentExecutionOptions): Promise<AgentEx
       model = agent.model ?? model;
     }
   }
+  if (!opts.skipUserInsert) {
+    // Save user message
+    const userMsgId = uuidv4();
+    await query(
+      `INSERT INTO messages (id, conversation_id, role, content) VALUES ($1, $2, 'user', $3)`,
+      [userMsgId, conversationId, userMessage]
+    );
 
-  // Save user message
-  const userMsgId = uuidv4();
-  await query(
-    `INSERT INTO messages (id, conversation_id, role, content) VALUES ($1, $2, 'user', $3)`,
-    [userMsgId, conversationId, userMessage]
-  );
-
-  // Update conversation title if it's the first message
-  await query(
-    `UPDATE conversations SET title = $1, updated_at = NOW()
-     WHERE id = $2 AND title = 'New Conversation'`,
-    [userMessage.slice(0, 80), conversationId]
-  );
+    // Update conversation title if it's the first message
+    await query(
+      `UPDATE conversations SET title = $1, updated_at = NOW()
+       WHERE id = $2 AND title = 'New Conversation'`,
+      [userMessage.slice(0, 80), conversationId]
+    );
+  }
 
   await query(
     `UPDATE conversations SET updated_at = NOW() WHERE id = $1`,
@@ -378,7 +397,29 @@ export async function executeAgent(opts: AgentExecutionOptions): Promise<AgentEx
     }
 
     if (!finalContent && iterations >= maxIterations) {
-      finalContent = 'I reached the maximum number of iterations. Here is what I found so far based on the tool results above.';
+      // Ran out of iterations — force one final no-tools call so the model
+      // summarizes what it actually found instead of a static fallback.
+      notify('generating');
+      messages.push({
+        role: 'user',
+        content:
+          'You have used all your tool-call budget. Do NOT call any more tools. ' +
+          'Now write your best final answer to the user using only the data already retrieved above. ' +
+          'If some part is missing, say briefly what you could and could not get.',
+      });
+      try {
+        const final = await groq.chat.completions.create({
+          model,
+          messages,
+          max_tokens: 4096,
+          temperature: 0.7,
+        } as unknown as Parameters<typeof groq.chat.completions.create>[0]) as {
+          choices: Array<{ message: { content: string | null } }>;
+        };
+        finalContent = final.choices[0]?.message?.content ?? 'I was unable to finish processing this request.';
+      } catch {
+        finalContent = 'I was unable to finish processing this request.';
+      }
     }
 
     // Save final assistant message
@@ -404,6 +445,8 @@ export async function executeAgent(opts: AgentExecutionOptions): Promise<AgentEx
     // Extract a learnable insight from this exchange (best-effort, non-blocking)
     const learnedInsight = await extractInsight(groq, model, userMessage, finalContent).catch(() => null);
 
+    agentRunStatus.delete(conversationId);
+
     return {
       messageId: assistantMsgId,
       content: finalContent,
@@ -414,6 +457,7 @@ export async function executeAgent(opts: AgentExecutionOptions): Promise<AgentEx
     };
 
   } catch (err) {
+    agentRunStatus.delete(conversationId);
     const errorMessage = err instanceof Error ? err.message : 'Unknown error';
     console.error('[agent] Execution error:', errorMessage);
 

@@ -9,6 +9,7 @@ import { AppLayout } from '@/components/layout/AppLayout';
 import LoginPage from '@/pages/Login';
 import RegisterPage from '@/pages/Register';
 import ChatPage from '@/pages/Chat';
+import ChannelsPage from '@/pages/Channels';
 import AgentsPage from '@/pages/Agents';
 import ArtifactsPage from '@/pages/Artifacts';
 import KnowledgePage from '@/pages/Knowledge';
@@ -55,6 +56,9 @@ export default function App() {
                 <Route path="/dashboard" element={<Navigate to="/chat" replace />} />
                 <Route path="/chat" element={<ChatPage />} />
                 <Route path="/chat/:id" element={<ChatPage />} />
+                <Route path="/room" element={<Navigate to="/channels" replace />} />
+                <Route path="/channels" element={<ChannelsPage />} />
+                <Route path="/channels/:id" element={<ChannelsPage />} />
                 <Route path="/agents" element={<AgentsPage />} />
                 <Route path="/artifacts" element={<ArtifactsPage />} />
                 <Route path="/knowledge" element={<KnowledgePage />} />

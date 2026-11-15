@@ -4,7 +4,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { query, queryOne } from '../database/pool';
 import { authenticate, AuthenticatedRequest } from '../middleware/authenticate';
 import { validateBody } from '../middleware/validate';
-import { executeAgent } from '../agents/engine';
+import { executeAgent, agentRunStatus } from '../agents/engine';
+import { resolveMentions, insertMentionRows } from '../utils/mentions';
 import { aiRateLimiter } from '../middleware/rateLimiter';
 
 const router = Router();
@@ -20,6 +21,8 @@ const RenameSchema = z.object({ title: z.string().min(1).max(200) });
 const SendMessageSchema = z.object({
   content: z.string().min(1).max(20000),
   agent_id: z.string().uuid().optional(),
+  // Whether the agent should reply. Defaults to true (@brain enabled).
+  respond: z.boolean().optional(),
 });
 
 const EditMessageSchema = z.object({
@@ -39,14 +42,18 @@ router.get('/', async (req: AuthenticatedRequest, res: Response): Promise<void> 
               COUNT(m.id)::int AS message_count
        FROM conversations c
        LEFT JOIN messages m ON m.conversation_id = c.id
-       WHERE c.workspace_id = $1 AND c.user_id = $2
+       WHERE c.workspace_id = $1
+         AND (c.user_id = $2 OR EXISTS(SELECT 1 FROM channel_members cm WHERE cm.conversation_id = c.id AND cm.user_id = $2))
+         AND (c.kind IS NULL OR c.kind = 'ai')
        GROUP BY c.id
        ORDER BY c.updated_at DESC
        LIMIT $3 OFFSET $4`,
       [workspaceId, userId, perPage, offset]
     ),
     queryOne<{ count: number }>(
-      `SELECT COUNT(*)::int AS count FROM conversations WHERE workspace_id = $1 AND user_id = $2`,
+      `SELECT COUNT(*)::int AS count FROM conversations WHERE workspace_id = $1
+        AND (user_id = $2 OR EXISTS(SELECT 1 FROM channel_members cm WHERE cm.conversation_id = conversations.id AND cm.user_id = $2))
+        AND (kind IS NULL OR kind = 'ai')`,
       [workspaceId, userId]
     ),
   ]);
@@ -86,7 +93,8 @@ router.get('/:id', async (req: AuthenticatedRequest, res: Response): Promise<voi
 
   const conv = await queryOne(
     `SELECT id, title, agent_id, created_at, updated_at
-     FROM conversations WHERE id = $1 AND workspace_id = $2 AND user_id = $3`,
+     FROM conversations c WHERE c.id = $1 AND c.workspace_id = $2
+       AND (c.user_id = $3 OR EXISTS(SELECT 1 FROM channel_members cm WHERE cm.conversation_id = c.id AND cm.user_id = $3))`,
     [req.params['id'], workspaceId, userId]
   );
 
@@ -135,6 +143,24 @@ router.delete('/:id', async (req: AuthenticatedRequest, res: Response): Promise<
   res.json({ message: 'Conversation deleted' });
 });
 
+// Live agent status for this conversation (polled by the UI while the agent runs)
+router.get('/:id/status', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+  const { userId, workspaceId } = req.user!;
+
+  const conv = await queryOne(
+    `SELECT id FROM conversations c WHERE c.id = $1 AND c.workspace_id = $2
+       AND (c.user_id = $3 OR EXISTS(SELECT 1 FROM channel_members cm WHERE cm.conversation_id = c.id AND cm.user_id = $3))`,
+    [req.params['id'], workspaceId, userId]
+  );
+  if (!conv) {
+    res.status(404).json({ error: 'Conversation not found' });
+    return;
+  }
+
+  const status = agentRunStatus.get(req.params['id']) ?? null;
+  res.json({ data: status });
+});
+
 // Get messages
 router.get('/:id/messages', async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const { userId, workspaceId } = req.user!;
@@ -143,7 +169,8 @@ router.get('/:id/messages', async (req: AuthenticatedRequest, res: Response): Pr
   const offset = (page - 1) * perPage;
 
   const conv = await queryOne(
-    `SELECT id FROM conversations WHERE id = $1 AND workspace_id = $2 AND user_id = $3`,
+    `SELECT id FROM conversations c WHERE c.id = $1 AND c.workspace_id = $2
+       AND (c.user_id = $3 OR EXISTS(SELECT 1 FROM channel_members cm WHERE cm.conversation_id = c.id AND cm.user_id = $3))`,
     [req.params['id'], workspaceId, userId]
   );
 
@@ -177,15 +204,46 @@ router.get('/:id/messages', async (req: AuthenticatedRequest, res: Response): Pr
 // Send message (triggers agent)
 router.post('/:id/messages', aiRateLimiter, validateBody(SendMessageSchema), async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const { userId, workspaceId } = req.user!;
-  const { content, agent_id } = req.body as z.infer<typeof SendMessageSchema>;
+  const { content, agent_id, respond } = req.body as z.infer<typeof SendMessageSchema>;
 
   const conv = await queryOne<{ id: string; agent_id: string }>(
-    `SELECT id, agent_id FROM conversations WHERE id = $1 AND workspace_id = $2 AND user_id = $3`,
+    `SELECT id, agent_id FROM conversations c WHERE c.id = $1 AND c.workspace_id = $2
+       AND (c.user_id = $3 OR EXISTS(SELECT 1 FROM channel_members cm WHERE cm.conversation_id = c.id AND cm.user_id = $3))`,
     [req.params['id'], workspaceId, userId]
   );
 
   if (!conv) {
     res.status(404).json({ error: 'Conversation not found' });
+    return;
+  }
+
+  // @brain control: reply unless explicitly disabled. A literal "@brain" tag
+  // in the text always counts as enabled even if the toggle was off.
+  const wantsReply = respond !== false || /@brain\b/i.test(content);
+
+  if (!wantsReply) {
+    // Store the message without triggering the agent
+    const messageId = uuidv4();
+    await query(
+      `INSERT INTO messages (id, conversation_id, role, content) VALUES ($1, $2, 'user', $3)`,
+      [messageId, conv.id, content]
+    );
+    // Deliver @mentions even when Brain isn't replying; tagged users get access
+    const mentions = await resolveMentions(content, workspaceId, userId);
+    await insertMentionRows(conv.id, messageId, mentions);
+    for (const m of mentions) {
+      await query(
+        `INSERT INTO channel_members (id, conversation_id, user_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+        [uuidv4(), conv.id, m.user_id]
+      );
+    }
+    await query(
+      `UPDATE conversations SET title = $1, updated_at = NOW()
+       WHERE id = $2 AND title = 'New Conversation'`,
+      [content.slice(0, 80), conv.id]
+    );
+    await query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [conv.id]);
+    res.json({ data: { messageId, content: '', toolCallCount: 0, status: 'stored', no_reply: true } });
     return;
   }
 
@@ -198,6 +256,22 @@ router.post('/:id/messages', aiRateLimiter, validateBody(SendMessageSchema), asy
     agentId: effectiveAgentId,
     userMessage: content,
   });
+
+  // Deliver @mentions on the user's message (the engine inserted it)
+  const um = await queryOne<{ id: string }>(
+    `SELECT id FROM messages WHERE conversation_id = $1 AND role = 'user' ORDER BY created_at DESC LIMIT 1`,
+    [conv.id]
+  );
+  if (um) {
+    const mentions = await resolveMentions(content, workspaceId, userId);
+    await insertMentionRows(conv.id, um.id, mentions);
+    for (const m of mentions) {
+      await query(
+        `INSERT INTO channel_members (id, conversation_id, user_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+        [uuidv4(), conv.id, m.user_id]
+      );
+    }
+  }
 
   res.json({ data: result });
 });
