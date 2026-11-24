@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, FormEvent, KeyboardEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
-  Hash, Lock, Send, Brain, Users, MessageSquare, Copy, Trash2, Check, SmilePlus,
+  Hash, Lock, Send, Brain, Users, MessageSquare, Copy, Trash2, Check, SmilePlus, BookOpen,
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -11,6 +11,8 @@ import { Button } from '@/components/ui/Button';
 import { SkeletonText } from '@/components/ui/Skeleton';
 import { cn } from '@/lib/utils';
 import { useAuth } from '@/hooks/useAuth';
+import { InsightSuggestion } from '@/features/chat/InsightSuggestion';
+import type { LearnedInsight } from '@/types';
 import toast from 'react-hot-toast';
 
 interface Channel {
@@ -102,34 +104,117 @@ function Avatar({ name, isBrain }: { name: string; isBrain: boolean }) {
   );
 }
 
-/** Copy / react / delete actions shown on message hover. */
-function HoverActions({ msg, mine, copiedId, onCopy, onReact, onDelete }: {
+/** Copy / react / delete / save to knowledge actions shown on message hover. */
+function HoverActions({ msg, mine, copiedId, onCopy, onReact, onDelete, channelName }: {
   msg: RoomMessage;
   mine: boolean;
   copiedId: string | null;
   onCopy: (msg: RoomMessage) => void;
   onReact: (msg: RoomMessage, emoji: string) => void;
   onDelete: (id: string) => void;
+  channelName: string;
 }) {
+  const qc = useQueryClient();
   const [picker, setPicker] = useState(false);
+  const [wikiMenu, setWikiMenu] = useState(false);
+  const [savedCategory, setSavedCategory] = useState<string | null>(null);
+
+  const saveMutation = useMutation({
+    mutationFn: async (category: 'fact' | 'document' | 'procedure' | 'note') => {
+      const isBrain = msg.role === 'assistant';
+      const cleanContent = msg.content.replace(/\s+/g, ' ').trim();
+      const firstLine = cleanContent.slice(0, 80);
+      const title = isBrain
+        ? `Brain in #${channelName}: ${firstLine}`
+        : `${msg.author_name ?? 'Message'} in #${channelName}: ${firstLine}`;
+      const content = isBrain
+        ? msg.content
+        : `${msg.author_name ? `**${msg.author_name}:**\n\n` : ''}${msg.content}`;
+      const tag = channelName.replace(/^#/, '').trim().toLowerCase();
+
+      await api.post('/knowledge', {
+        title,
+        content,
+        type: category,
+        tags: ['channel', tag || 'general'],
+      });
+      return category;
+    },
+    onSuccess: (cat) => {
+      qc.invalidateQueries({ queryKey: ['knowledge'] });
+      qc.invalidateQueries({ queryKey: ['dashboard'] });
+      setSavedCategory(cat);
+      setWikiMenu(false);
+      toast.success(`Saved to knowledge base as ${cat}`);
+    },
+    onError: () => toast.error('Failed to save to knowledge base'),
+  });
+
   return (
     <div className="absolute -top-3 right-4 hidden group-hover:flex items-center gap-0.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 shadow-sm px-1 py-0.5 z-10 animate-pop-in">
       <div className="relative">
         <button
-          onClick={() => setPicker((p) => !p)}
+          onClick={() => { setPicker((p) => !p); setWikiMenu(false); }}
           title="React"
           className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
         >
           <SmilePlus className="h-3.5 w-3.5" />
         </button>
         {picker && (
-          <div className="absolute right-0 top-full mt-1 flex gap-0.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 shadow-md p-1 animate-pop-in">
+          <div className="absolute right-0 top-full mt-1 flex gap-0.5 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 shadow-md p-1 animate-pop-in z-20">
             {QUICK_EMOJIS.map((e) => (
               <button key={e} onClick={() => { setPicker(false); onReact(msg, e); }} className="text-base hover:scale-125 active:scale-95 transition-transform px-0.5">{e}</button>
             ))}
           </div>
         )}
       </div>
+
+      {/* Save to Knowledge Base / Wiki with Category selection */}
+      <div className="relative">
+        <button
+          onClick={() => {
+            if (!savedCategory && !saveMutation.isPending) {
+              setWikiMenu((w) => !w);
+              setPicker(false);
+            }
+          }}
+          title={savedCategory ? `Saved to knowledge base as ${savedCategory}` : 'Save to knowledge base'}
+          className={cn(
+            'p-1 rounded transition-colors',
+            savedCategory
+              ? 'text-green-500 hover:text-green-600'
+              : 'hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'
+          )}
+          disabled={saveMutation.isPending}
+        >
+          {savedCategory ? <Check className="h-3.5 w-3.5" /> : <BookOpen className="h-3.5 w-3.5" />}
+        </button>
+
+        {wikiMenu && !savedCategory && (
+          <div className="absolute right-0 top-full mt-1 z-30 w-40 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 shadow-xl py-1 text-xs animate-pop-in">
+            <p className="px-2.5 py-1 text-[10px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider">
+              Save to Knowledge as:
+            </p>
+            {[
+              { value: 'fact', label: '📌 Fact' },
+              { value: 'document', label: '📄 Document' },
+              { value: 'procedure', label: '📋 Procedure' },
+              { value: 'note', label: '📝 Note' },
+            ].map((cat) => (
+              <button
+                key={cat.value}
+                type="button"
+                onClick={() => saveMutation.mutate(cat.value as any)}
+                disabled={saveMutation.isPending}
+                className="w-full text-left px-2.5 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-200 transition-colors flex items-center gap-1.5 cursor-pointer"
+              >
+                {cat.label}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
       <button
         onClick={() => onCopy(msg)}
         title="Copy"
@@ -190,6 +275,7 @@ export default function ChannelsPage() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [nearBottom, setNearBottom] = useState(true);
   const [unreadMarker, setUnreadMarker] = useState<number>(0);
+  const [pendingInsight, setPendingInsight] = useState<LearnedInsight | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Messages created after mount animate in; history loads static
   const mountAt = useRef(Date.now());
@@ -245,7 +331,13 @@ export default function ChannelsPage() {
     mutationFn: async (content: string) => {
       if (/@brain\b/i.test(content)) setBrainThinking(true);
       const res = await api.post(`/channels/${activeId}/messages`, { content });
-      return res.data.data;
+      return res.data.data as {
+        messageId: string;
+        content: string;
+        toolCallCount: number;
+        status: string;
+        learnedInsight?: LearnedInsight | null;
+      };
     },
     // Optimistic send — show the message immediately
     onMutate: (content) => {
@@ -262,8 +354,13 @@ export default function ChannelsPage() {
       qc.setQueryData<RoomMessage[]>(['channel-messages', activeId], (old) => [...(old ?? []), optimistic]);
       return { optimisticId: optimistic.id };
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
       setBrainThinking(false);
+      if (result?.learnedInsight) {
+        setPendingInsight(result.learnedInsight);
+      } else {
+        setPendingInsight(null);
+      }
     },
     onError: (err: unknown, content, context) => {
       setBrainThinking(false);
@@ -314,6 +411,7 @@ export default function ChannelsPage() {
   useEffect(() => {
     setNearBottom(true);
     setUnreadMarker(active?.unread_count ?? 0);
+    setPendingInsight(null);
     messagesEndRef.current?.scrollIntoView();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId]);
@@ -398,6 +496,7 @@ export default function ChannelsPage() {
 
   const visible = (messages ?? []).filter((m) => m.role !== 'tool');
   const canPost = !!active && (active.kind === 'dm' || active.visibility === 'public' || active.is_member);
+  const channelTitle = active?.kind === 'dm' ? (active.peer_name ?? 'Direct message') : (active?.name ?? 'channel');
 
   return (
     <div className="flex flex-1 h-full">
@@ -491,7 +590,7 @@ export default function ChannelsPage() {
                           {isBrainMsg ? <BrainMarkdown content={msg.content} /> : <MessageText content={msg.content} meHandle={meHandle} />}
                           <ReactionPills msg={msg} onReact={onReact} />
                         </div>
-                        <HoverActions msg={msg} mine={mine} copiedId={copiedId} onCopy={copyMessage} onReact={onReact} onDelete={(id) => deleteMutation.mutate(id)} />
+                        <HoverActions msg={msg} mine={mine} copiedId={copiedId} onCopy={copyMessage} onReact={onReact} onDelete={(id) => deleteMutation.mutate(id)} channelName={channelTitle} />
                       </div>
                     ) : (
                       // First message of a group — avatar + author + time
@@ -512,7 +611,7 @@ export default function ChannelsPage() {
                           {isBrainMsg ? <BrainMarkdown content={msg.content} /> : <MessageText content={msg.content} meHandle={meHandle} />}
                           <ReactionPills msg={msg} onReact={onReact} />
                         </div>
-                        <HoverActions msg={msg} mine={mine} copiedId={copiedId} onCopy={copyMessage} onReact={onReact} onDelete={(id) => deleteMutation.mutate(id)} />
+                        <HoverActions msg={msg} mine={mine} copiedId={copiedId} onCopy={copyMessage} onReact={onReact} onDelete={(id) => deleteMutation.mutate(id)} channelName={channelTitle} />
                       </div>
                     )}
                   </div>
@@ -528,6 +627,12 @@ export default function ChannelsPage() {
                     <span className="text-[11px] text-gray-400 ml-1">Brain is thinking…</span>
                   </div>
                 </div>
+              )}
+              {pendingInsight && !brainThinking && (
+                <InsightSuggestion
+                  insight={pendingInsight}
+                  onDismiss={() => setPendingInsight(null)}
+                />
               )}
               <div ref={messagesEndRef} />
             </div>
