@@ -90,6 +90,16 @@ router.get('/', async (req: AuthenticatedRequest, res: Response): Promise<void> 
     );
   }
 
+  // Auto-enroll user in public channels of this workspace
+  await query(
+    `INSERT INTO channel_members (id, conversation_id, user_id)
+     SELECT gen_random_uuid(), c.id, $2
+     FROM conversations c
+     WHERE c.workspace_id = $1 AND c.kind = 'channel' AND c.visibility = 'public'
+     ON CONFLICT (conversation_id, user_id) DO NOTHING`,
+    [workspaceId, userId]
+  );
+
   const channels = await query<ChannelRow>(
     `SELECT c.id, c.name, c.kind, c.visibility, c.user_id,
             EXISTS(SELECT 1 FROM channel_members cm WHERE cm.conversation_id = c.id AND cm.user_id = $2) AS is_member,

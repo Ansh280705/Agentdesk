@@ -125,12 +125,38 @@ router.post('/login', authRateLimiter, validateBody(LoginSchema), async (req: Re
     return;
   }
 
-  const workspace = await queryOne<{ id: string }>(
-    `SELECT id FROM workspaces WHERE owner_id = $1 LIMIT 1`,
+  // Resolve workspace for the user:
+  // 1. Check workspace_members (handles members who joined via invite link)
+  // 2. Fall back to owned workspace
+  // 3. Fall back to main team workspace
+  const memberWs = await queryOne<{ workspace_id: string }>(
+    `SELECT wm.workspace_id
+     FROM workspace_members wm
+     JOIN workspaces w ON w.id = wm.workspace_id
+     WHERE wm.user_id = $1
+     ORDER BY (wm.workspace_id = '4aab8669-02a4-440e-b95c-b349f016c977') DESC, (wm.role = 'owner') DESC, wm.created_at ASC
+     LIMIT 1`,
     [user.id]
   );
 
-  const workspaceId = workspace?.id ?? uuidv4();
+  let workspaceId = memberWs?.workspace_id;
+  if (!workspaceId) {
+    const owned = await queryOne<{ id: string }>(
+      `SELECT id FROM workspaces WHERE owner_id = $1 LIMIT 1`,
+      [user.id]
+    );
+    workspaceId = owned?.id;
+  }
+
+  if (!workspaceId) {
+    workspaceId = '4aab8669-02a4-440e-b95c-b349f016c977';
+    await query(
+      `INSERT INTO workspace_members (id, workspace_id, user_id, role)
+       VALUES (gen_random_uuid(), $1, $2, 'member') ON CONFLICT DO NOTHING`,
+      [workspaceId, user.id]
+    );
+  }
+
   const token = signToken({ userId: user.id, email: user.email, workspaceId });
 
   await query(
