@@ -225,8 +225,8 @@ router.post('/:id/messages', aiRateLimiter, validateBody(SendMessageSchema), asy
     // Store the message without triggering the agent
     const messageId = uuidv4();
     await query(
-      `INSERT INTO messages (id, conversation_id, role, content) VALUES ($1, $2, 'user', $3)`,
-      [messageId, conv.id, content]
+      `INSERT INTO messages (id, conversation_id, role, content, user_id) VALUES ($1, $2, 'user', $3, $4)`,
+      [messageId, conv.id, content, userId]
     );
     // Deliver @mentions even when Brain isn't replying; tagged users get access
     const mentions = await resolveMentions(content, workspaceId, userId);

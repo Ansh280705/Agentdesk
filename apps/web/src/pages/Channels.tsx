@@ -354,7 +354,8 @@ export default function ChannelsPage() {
   const filteredMembers = (members ?? []).filter((m) =>
     m.id !== user?.id &&
     (m.handle.toLowerCase().startsWith(mentionQuery.toLowerCase()) ||
-     m.name.toLowerCase().includes(mentionQuery.toLowerCase()))
+     m.name.toLowerCase().includes(mentionQuery.toLowerCase()) ||
+     (m.email && m.email.toLowerCase().includes(mentionQuery.toLowerCase())))
   );
   // Virtual @all option — tags everyone in the workspace (Brain excluded)
   const allEntry: Member = { id: 'all', name: 'Everyone', handle: 'all', is_bot: false };

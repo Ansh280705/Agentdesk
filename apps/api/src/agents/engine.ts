@@ -185,8 +185,8 @@ Keep tool calls minimal — avoid repeating the same query with slightly differe
     // Save user message
     const userMsgId = uuidv4();
     await query(
-      `INSERT INTO messages (id, conversation_id, role, content) VALUES ($1, $2, 'user', $3)`,
-      [userMsgId, conversationId, userMessage]
+      `INSERT INTO messages (id, conversation_id, role, content, user_id) VALUES ($1, $2, 'user', $3, $4)`,
+      [userMsgId, conversationId, userMessage, userId]
     );
 
     // Update conversation title if it's the first message

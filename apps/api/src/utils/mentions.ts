@@ -10,9 +10,30 @@ import { query } from '../database/pool';
 export interface MentionRow { user_id: string; handle: string; name: string }
 interface MemberRow { id: string; name: string; email: string }
 
-function handleFor(m: MemberRow): string {
-  const base = (m.name?.split(/\s+/)[0] || m.email.split('@')[0] || m.id.slice(0, 6)).toLowerCase();
-  return base.replace(/[^a-z0-9_]/g, '') || m.id.slice(0, 6);
+export function handleFor(m: MemberRow): string {
+  // If first name exists and is reasonable, use it; otherwise fallback to email prefix
+  const firstName = m.name?.trim().split(/\s+/)[0]?.toLowerCase().replace(/[^a-z0-9_]/g, '');
+  if (firstName && firstName.length >= 2) return firstName;
+  const emailPrefix = (m.email.split('@')[0] || '').toLowerCase().replace(/[^a-z0-9_]/g, '');
+  return emailPrefix || m.id.slice(0, 6);
+}
+
+function getMemberAliases(m: MemberRow): string[] {
+  const aliases = new Set<string>();
+  const h = handleFor(m);
+  if (h) aliases.add(h);
+
+  const fullNameNoSpaces = (m.name || '').toLowerCase().replace(/[^a-z0-9_]/g, '');
+  if (fullNameNoSpaces) aliases.add(fullNameNoSpaces);
+
+  const emailUser = (m.email.split('@')[0] || '').toLowerCase().replace(/[^a-z0-9_]/g, '');
+  if (emailUser) {
+    aliases.add(emailUser);
+    const noDigits = emailUser.replace(/[0-9]+$/, '');
+    if (noDigits && noDigits.length >= 2) aliases.add(noDigits);
+  }
+
+  return Array.from(aliases);
 }
 
 /** Resolve @handles + @all in `content` against workspace members (sender excluded). */
@@ -26,9 +47,12 @@ export async function resolveMentions(content: string, workspaceId: string, send
   const found = new Map<string, MentionRow>();
   for (const m of members) {
     if (m.id === senderId) continue;
-    const handle = handleFor(m);
-    if (new RegExp(`@${handle}\\b`, 'i').test(content)) {
-      found.set(m.id, { user_id: m.id, handle, name: m.name });
+    const aliases = getMemberAliases(m);
+    for (const alias of aliases) {
+      if (new RegExp(`@${alias}\\b`, 'i').test(content)) {
+        found.set(m.id, { user_id: m.id, handle: handleFor(m), name: m.name });
+        break;
+      }
     }
   }
   // @all → everyone in the workspace

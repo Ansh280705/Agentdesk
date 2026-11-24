@@ -66,7 +66,8 @@ export default function ChatPage() {
 
   const filteredMembers = (members ?? []).filter((m) =>
     m.handle.toLowerCase().startsWith(mentionQuery.toLowerCase()) ||
-    m.name.toLowerCase().includes(mentionQuery.toLowerCase())
+    m.name.toLowerCase().includes(mentionQuery.toLowerCase()) ||
+    ('email' in m && typeof (m as any).email === 'string' && (m as any).email.toLowerCase().includes(mentionQuery.toLowerCase()))
   ).slice(0, 8);
 
   const updateMention = (text: string, caret: number) => {
