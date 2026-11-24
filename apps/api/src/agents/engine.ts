@@ -26,7 +26,7 @@ export interface AgentExecutionResult {
   learnedInsight?: {
     title: string;
     content: string;
-    type: 'fact' | 'note' | 'procedure';
+    type: 'fact' | 'note' | 'procedure' | 'document';
     tags: string[];
   } | null;
 }
@@ -92,7 +92,7 @@ Rules:
 - Keep content to 1-3 sentences — be specific and concrete
 
 Respond ONLY with valid JSON in this exact format, nothing else:
-{"title": "Short descriptive title (max 8 words)", "content": "The knowledge to save (1-3 sentences)", "type": "fact|note|procedure", "tags": ["tag1", "tag2"]}
+{"title": "Short descriptive title (max 8 words)", "content": "The knowledge to save (1-3 sentences)", "type": "fact|note|procedure|document", "tags": ["tag1", "tag2"]}
 
 If truly nothing is worth saving: respond with exactly: null`,
         },
@@ -119,7 +119,7 @@ If truly nothing is worth saving: respond with exactly: null`,
     return {
       title: String(parsed.title).slice(0, 200),
       content: String(parsed.content).slice(0, 2000),
-      type: (['fact', 'note', 'procedure'].includes(parsed.type) ? parsed.type : 'note') as 'fact' | 'note' | 'procedure',
+      type: (['fact', 'note', 'procedure', 'document'].includes(parsed.type) ? parsed.type : 'note') as 'fact' | 'note' | 'procedure' | 'document',
       tags: Array.isArray(parsed.tags) ? parsed.tags.slice(0, 5).map((t: unknown) => String(t)) : [],
     };
   } catch {

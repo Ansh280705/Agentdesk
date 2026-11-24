@@ -146,6 +146,6 @@ export interface ChartSpec {
 export interface LearnedInsight {
   title: string;
   content: string;
-  type: 'fact' | 'note' | 'procedure';
+  type: 'fact' | 'note' | 'procedure' | 'document';
   tags: string[];
 }

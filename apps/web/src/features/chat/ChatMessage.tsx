@@ -25,6 +25,7 @@ export function ChatMessage({ message, conversationId, onFeedback, promptText }:
   const [editing, setEditing] = useState(false);
   const [editContent, setEditContent] = useState(message.content);
   const [wikiSaved, setWikiSaved] = useState(false);
+  const [showWikiMenu, setShowWikiMenu] = useState(false);
 
   const isUser = message.role === 'user';
   const isAssistant = message.role === 'assistant';
@@ -60,19 +61,22 @@ export function ChatMessage({ message, conversationId, onFeedback, promptText }:
 
   // Save this answer to the workspace knowledge wiki
   const wikiMutation = useMutation({
-    mutationFn: () => {
+    mutationFn: (categoryType?: 'fact' | 'document' | 'procedure' | 'note') => {
       const q = (promptText ?? '').replace(/\s+/g, ' ').trim();
       const title = q ? `Q&A: ${q.slice(0, 110)}` : `Brain answer — ${new Date().toLocaleDateString()}`;
       const content = q
         ? `**Question:** ${q}\n\n**Answer:**\n${message.content}`
         : message.content;
-      return api.post('/knowledge', { title, content, type: 'note', tags: ['wiki', 'chat'] });
+      return api.post('/knowledge', { title, content, type: categoryType ?? 'note', tags: ['wiki', 'chat'] });
     },
-    onSuccess: () => {
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: ['knowledge'] });
+      qc.invalidateQueries({ queryKey: ['dashboard'] });
       setWikiSaved(true);
-      toast.success('Saved to wiki');
+      setShowWikiMenu(false);
+      toast.success(`Saved to knowledge base as ${vars ?? 'note'}`);
     },
-    onError: () => toast.error('Could not save to wiki'),
+    onError: () => toast.error('Could not save to knowledge base'),
   });
 
   // Regenerate from this point
@@ -190,14 +194,39 @@ export function ChatMessage({ message, conversationId, onFeedback, promptText }:
                   >
                     {copied ? <Check className="h-3 w-3 text-green-400" /> : <Copy className="h-3 w-3" />}
                   </button>
-                  <button
-                    onClick={() => !wikiSaved && wikiMutation.mutate()}
-                    className={cn('p-1 rounded transition-colors', wikiSaved ? 'text-green-400' : 'text-gray-500 hover:text-gray-300 hover:bg-[#27272a]')}
-                    title={wikiSaved ? 'Saved to wiki' : 'Save to wiki'}
-                    disabled={wikiMutation.isPending || wikiSaved}
-                  >
-                    {wikiSaved ? <Check className="h-3 w-3" /> : <BookOpen className="h-3 w-3" />}
-                  </button>
+                  <div className="relative">
+                    <button
+                      onClick={() => !wikiSaved && setShowWikiMenu((v) => !v)}
+                      className={cn('p-1 rounded transition-colors', wikiSaved ? 'text-green-400' : 'text-gray-500 hover:text-gray-300 hover:bg-[#27272a]')}
+                      title={wikiSaved ? 'Saved to knowledge base' : 'Save to knowledge base'}
+                      disabled={wikiMutation.isPending || wikiSaved}
+                    >
+                      {wikiSaved ? <Check className="h-3 w-3" /> : <BookOpen className="h-3 w-3" />}
+                    </button>
+                    {showWikiMenu && !wikiSaved && (
+                      <div className="absolute right-0 bottom-full mb-1 z-30 w-36 rounded-lg bg-white dark:bg-[#1f232b] border border-gray-200 dark:border-gray-700 shadow-xl py-1 text-xs">
+                        <p className="px-2.5 py-1 text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
+                          Save as category
+                        </p>
+                        {[
+                          { value: 'fact', label: '📌 Fact' },
+                          { value: 'document', label: '📄 Document' },
+                          { value: 'procedure', label: '📋 Procedure' },
+                          { value: 'note', label: '📝 Note' },
+                        ].map((cat) => (
+                          <button
+                            key={cat.value}
+                            type="button"
+                            onClick={() => wikiMutation.mutate(cat.value as any)}
+                            disabled={wikiMutation.isPending}
+                            className="w-full text-left px-2.5 py-1.5 hover:bg-gray-100 dark:hover:bg-gray-700/60 text-gray-700 dark:text-gray-200 transition-colors flex items-center gap-1.5 cursor-pointer"
+                          >
+                            {cat.label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                   <button
                     onClick={() => regenerateMutation.mutate()}
                     className="p-1 rounded text-gray-500 hover:text-gray-300 hover:bg-[#27272a] transition-colors"
