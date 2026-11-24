@@ -58,6 +58,19 @@ function getDemoResponse(): string {
 }
 
 /**
+ * Smartly truncate text while preserving head and tail context.
+ * Prevents exceeding token-per-minute (TPM) limits on long chats or big outputs.
+ */
+function smartTruncate(text: string, maxChars: number = 1800): string {
+  if (!text || text.length <= maxChars) return text;
+  const headLen = Math.floor(maxChars * 0.7);
+  const tailLen = Math.floor(maxChars * 0.25);
+  const head = text.slice(0, headLen);
+  const tail = text.slice(-tailLen);
+  return `${head}\n\n[...content truncated for length...]\n\n${tail}`;
+}
+
+/**
  * Extracts a learnable insight from a user<>assistant exchange.
  * Returns null if there's nothing worth saving (chit-chat, errors, etc.)
  */
@@ -78,7 +91,7 @@ async function extractInsight(
 
   try {
     const extractParams: Record<string, unknown> = {
-      model,
+      model: 'llama-3.1-8b-instant',
       messages: [
         {
           role: 'system',
@@ -220,12 +233,10 @@ Keep tool calls minimal — avoid repeating the same query with slightly differe
   const groq = new Groq({ apiKey: config.groqApiKey });
   const groqTools = registry.toGroqTools(allowedTools);
 
-  // Load recent conversation history (last 20 messages)
-  // IMPORTANT: Only load user and assistant text messages for context.
-  // Tool call messages (role='tool') and assistant messages with tool_calls
-  // are only valid within a single turn's execution loop — replaying them
-  // in a new turn causes errors with models like openai/gpt-oss-120b.
-  const history = await query<{ role: string; content: string }>(
+  // Load recent conversation history (strictly last 5 messages for context)
+  // Only load user and assistant text messages.
+  // Exclude error messages, tool calls, and current turn's message.
+  const rawHistory = await query<{ role: string; content: string }>(
     `SELECT role, content
      FROM messages
      WHERE conversation_id = $1
@@ -233,22 +244,34 @@ Keep tool calls minimal — avoid repeating the same query with slightly differe
        AND (tool_call_id IS NULL OR tool_call_id = '')
        AND content != ''
      ORDER BY created_at DESC
-     LIMIT 20`,
+     LIMIT 10`,
     [conversationId]
   );
 
+  // Filter out system error messages and empty content
+  const cleanHistory = rawHistory
+    .filter((m) => {
+      if (!m.content || !m.content.trim()) return false;
+      if (m.role === 'assistant' && m.content.startsWith('I encountered an error while processing your request:')) return false;
+      return true;
+    })
+    .reverse();
+
+  // Exclude current user message if it was already inserted into messages table
+  const priorHistory = (cleanHistory.length > 0 && cleanHistory[cleanHistory.length - 1].content.trim() === userMessage.trim())
+    ? cleanHistory.slice(0, -1)
+    : cleanHistory;
+
+  // Take strictly the last 5 messages as requested to prevent TPM limits
+  const last5Messages = priorHistory.slice(-5);
+
   const messages: GroqMessage[] = [
     { role: 'system', content: systemPrompt },
-    // Reverse so oldest first, exclude the user message we just added
-    ...history
-      .reverse()
-      .slice(0, -1) // exclude the message we just inserted
-      .filter((m) => m.content && m.content.trim() !== '')
-      .map((m): GroqMessage => ({
-        role: m.role as 'user' | 'assistant',
-        content: m.content,
-        // Never replay tool_calls in history — causes API errors on multi-turn
-      })),
+    ...last5Messages.map((m): GroqMessage => ({
+      role: m.role as 'user' | 'assistant',
+      // Smartly truncate individual older messages to 1500 chars to avoid blowing the TPM limit
+      content: smartTruncate(m.content, 1500),
+    })),
     { role: 'user', content: userMessage },
   ];
 
@@ -256,6 +279,131 @@ Keep tool calls minimal — avoid repeating the same query with slightly differe
   let iterations = 0;
   let finalContent = '';
   const artifacts: Array<{ type: string; data: unknown }> = [];
+
+  /**
+   * Smartly prune messages to stay strictly within TPM safety limits (~15,000 chars ≈ 3,750 tokens)
+   */
+  const pruneMessagesToBudget = (msgs: GroqMessage[], maxChars: number = 15000): GroqMessage[] => {
+    let total = msgs.reduce((sum, m) => sum + (m.content?.length || 0), 0);
+    if (total <= maxChars) return msgs;
+
+    console.warn(`[agent] Total message chars (${total}) exceeds budget (${maxChars}). Compressing context...`);
+
+    // Step 1: Compress tool outputs first
+    let compressed = msgs.map((m) => {
+      if (m.role === 'tool' && m.content && m.content.length > 1000) {
+        return { ...m, content: smartTruncate(m.content, 1000) };
+      }
+      return m;
+    });
+
+    total = compressed.reduce((sum, m) => sum + (m.content?.length || 0), 0);
+    if (total <= maxChars) return compressed;
+
+    // Step 2: Drop older history messages if still over budget (keep system prompt at 0 and current turn at the end)
+    const system = compressed[0];
+    const rest = compressed.slice(1);
+
+    while (rest.length > 2 && total > maxChars) {
+      const dropIdx = rest.findIndex((m) => m.role === 'user' || m.role === 'assistant');
+      if (dropIdx >= 0 && dropIdx < rest.length - 1) {
+        const dropped = rest.splice(dropIdx, 1)[0];
+        total -= (dropped.content?.length || 0);
+      } else {
+        break;
+      }
+    }
+
+    return [system, ...rest];
+  };
+
+  /**
+   * Execute Groq completion with smart pruning and automatic fallback if 413 or TPM rate limits are encountered
+   */
+  const executeWithPruningAndFallback = async (
+    reqMessages: GroqMessage[],
+    currentModel: string,
+    tools: unknown[]
+  ): Promise<{
+    choices: Array<{
+      finish_reason: string;
+      message: {
+        content: string | null;
+        tool_calls?: Array<{
+          id: string;
+          type: 'function';
+          function: { name: string; arguments: string };
+        }>;
+      };
+    }>;
+  }> => {
+    const pruned = pruneMessagesToBudget(reqMessages);
+
+    const completionParams: Record<string, unknown> = {
+      model: currentModel,
+      messages: pruned,
+      max_tokens: 4096,
+      temperature: 0.7,
+    };
+    if (tools.length > 0) {
+      completionParams['tools'] = tools;
+    }
+
+    try {
+      return (await groq.chat.completions.create(
+        completionParams as unknown as Parameters<typeof groq.chat.completions.create>[0]
+      )) as any;
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const isSizeOrTpmError =
+        (err as { status?: number })?.status === 413 ||
+        errMsg.includes('413') ||
+        errMsg.includes('Request too large') ||
+        errMsg.includes('rate_limit_exceeded') ||
+        errMsg.includes('tokens per minute') ||
+        errMsg.includes('TPM');
+
+      if (!isSizeOrTpmError) throw err;
+
+      console.warn(`[agent] 413/TPM rate limit encountered (${errMsg}). Retrying with emergency minimal context...`);
+
+      // Emergency reduction: Keep only system prompt + current turn tool results + current user message
+      const emergencyMessages: GroqMessage[] = [
+        pruned[0], // system prompt
+        ...pruned
+          .filter((m) => m.role === 'tool' && m.tool_call_id)
+          .map((m) => ({
+            ...m,
+            content: smartTruncate(m.content || '', 600),
+          })),
+        { role: 'user', content: smartTruncate(userMessage, 1200) },
+      ];
+
+      // Wait 1.5 seconds for TPM window to clear
+      await new Promise((r) => setTimeout(r, 1500));
+
+      try {
+        return (await groq.chat.completions.create({
+          model: currentModel,
+          messages: emergencyMessages,
+          max_tokens: 3000,
+          temperature: 0.7,
+          ...(tools.length > 0 ? { tools } : {}),
+        } as unknown as Parameters<typeof groq.chat.completions.create>[0])) as any;
+      } catch (retryErr: unknown) {
+        const retryErrMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+        console.warn(`[agent] Retry with ${currentModel} failed: ${retryErrMsg}. Falling back to llama-3.3-70b-versatile...`);
+
+        return (await groq.chat.completions.create({
+          model: 'llama-3.3-70b-versatile',
+          messages: emergencyMessages,
+          max_tokens: 3000,
+          temperature: 0.7,
+          ...(tools.length > 0 ? { tools } : {}),
+        } as unknown as Parameters<typeof groq.chat.completions.create>[0])) as any;
+      }
+    }
+  };
 
   try {
     while (iterations < maxIterations) {
@@ -270,31 +418,7 @@ Keep tool calls minimal — avoid repeating the same query with slightly differe
         return true;
       });
 
-    // Use non-streaming completion
-    const completionParams: Record<string, unknown> = {
-      model,
-      messages: requestMessages,
-      max_tokens: 4096,
-      temperature: 0.7,
-    };
-    if (groqTools.length > 0) {
-      completionParams['tools'] = groqTools;
-    }
-
-    // Cast through unknown to avoid Groq SDK's Stream union type complexity
-    const completion = await groq.chat.completions.create(completionParams as unknown as Parameters<typeof groq.chat.completions.create>[0]) as {
-      choices: Array<{
-        finish_reason: string;
-        message: {
-          content: string | null;
-          tool_calls?: Array<{
-            id: string;
-            type: 'function';
-            function: { name: string; arguments: string };
-          }>;
-        };
-      }>;
-    };
+      const completion = await executeWithPruningAndFallback(requestMessages, model, groqTools);
 
     const choice = completion.choices[0];
     if (!choice) {
@@ -356,9 +480,12 @@ Keep tool calls minimal — avoid repeating the same query with slightly differe
             }
           }
 
-          const toolResultContent = toolResult.success
+          const rawToolResult = toolResult.success
             ? JSON.stringify(toolResult.result)
             : JSON.stringify({ error: toolResult.error });
+
+          // Cap tool output sent back to LLM to 2,500 characters so large query results don't blow token budget
+          const toolResultContent = smartTruncate(rawToolResult, 2500);
 
           messages.push({
             role: 'tool',
@@ -408,14 +535,12 @@ Keep tool calls minimal — avoid repeating the same query with slightly differe
           'If some part is missing, say briefly what you could and could not get.',
       });
       try {
-        const final = await groq.chat.completions.create({
-          model,
-          messages,
-          max_tokens: 4096,
-          temperature: 0.7,
-        } as unknown as Parameters<typeof groq.chat.completions.create>[0]) as {
-          choices: Array<{ message: { content: string | null } }>;
-        };
+        const finalMsgs = messages.filter((m) => {
+          if (m.role === 'tool') return !!(m.tool_call_id && m.content);
+          if (m.role === 'assistant' && !m.content && !m.tool_calls?.length) return false;
+          return true;
+        });
+        const final = await executeWithPruningAndFallback(finalMsgs, model, []);
         finalContent = final.choices[0]?.message?.content ?? 'I was unable to finish processing this request.';
       } catch {
         finalContent = 'I was unable to finish processing this request.';
